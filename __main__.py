@@ -7,7 +7,6 @@ import pyarrow as pa
 from pyspark.sql import SparkSession
 from urllib.parse import urljoin
 
-from src.DatabaseStrategy import DatabaseFactory
 from src.arrow_uploader import ArrowUploader
 
 # 初始化日志
@@ -109,51 +108,6 @@ def run_spark_job(config):
     finally:
         spark.stop()
 
-def process_partition(partition, config, minio_bucket, batch_size=10):
-    """处理每个分区，分区内将所有批次合并为一个 Arrow 表后上传到 MinIO，"""
-    rows = list(partition)
-    if not rows:
-        logger.info("Empty partition, skipping.")
-        return iter([])  # 空分区返回空迭代器
-
-    # 提取所有可能的字段
-    all_columns = set()
-    for row in rows:
-        all_columns.update(row.asDict().keys())
-    logger.info(f"Extracted columns: {all_columns}")
-
-    # 初始化存储所有批次数据的字典
-    combined_data = {col: [] for col in all_columns}
-
-    # 分区内批次处理
-    for i in range(0, len(rows), batch_size):
-        batch_rows = rows[i:i + batch_size]
-        logger.info(f"Processing batch {i // batch_size + 1} of {len(rows) // batch_size + 1}")
-        for row in batch_rows:
-            row_dict = row.asDict()
-            for col in all_columns:
-                combined_data[col].append(row_dict.get(col, None))
-
-    # 将所有批次数据合并为一个 Arrow 表
-    arrow_table = pa.Table.from_pydict(combined_data)
-    logger.info(f"Combined data into Arrow Table with schema: {arrow_table.schema}")
-
-    # 构造文件名
-    unique_id = uuid.uuid4().hex
-    object_name = f"data/{config.filename}_partition_{unique_id}.arrow"
-    logger.info(f"Constructed object name: {object_name}")
-
-    # 初始化 ArrowUploader
-    arrow_uploader = ArrowUploader(config.endpoint, config.accesskey, config.secretkey, minio_bucket)
-    logger.info(f"Initialized ArrowUploader with endpoint: {config.endpoint}, bucket: {minio_bucket}")
-
-    # 上传到 MinIO
-    arrow_uploader.save_to_minio(arrow_table, object_name)
-    logger.info(f"Uploaded partition to MinIO: {object_name}")
-
-    # 返回 URL
-    return iter([object_name])
-
 def notify_server_of_completion(config, object_name, total_rows):
     server_endpoint = f"{config.serverip}:{config.serverport}"
     url = urljoin(f"http://{server_endpoint}", "/api/job/completed")
@@ -198,54 +152,6 @@ def save_dataframe_to_minio(result, config, arrow_uploader):
     except Exception as e:
         logger.error(f"Error during Arrow Table conversion or upload to MinIO: {e}")
         return None
-
-def convert_dataframe_to_arrow(df):
-    """将 DataFrame 转换为 PyArrow Table。"""
-    # 获取列名和数据
-    columns = df.columns
-    data = df.collect()
-
-    # 创建 PyArrow Table
-    arrow_table = pa.Table.from_arrays(
-        [pa.array([row[col] for row in data]) for col in columns],
-        names=columns
-    )
-
-    return arrow_table
-
-
-def convert_partition_to_arrow(rows):
-    """将每个分区的数据直接转换为 PyArrow Table。"""
-    rows = list(rows)  # 将迭代器转为列表，避免重复消费
-
-    if not rows:
-        return  # 空分区直接跳过
-
-    # 获取列名和数据
-    columns = rows[0].__fields__ if hasattr(rows[0], "__fields__") else rows[0].asDict().keys()
-    data = [[row[col] for col in columns] for row in rows]
-
-    # 创建 PyArrow Table
-    arrow_table = pa.Table.from_arrays(
-        [pa.array([row[i] for row in data]) for i in range(len(columns))],
-        names=columns
-    )
-
-    yield arrow_table
-
-def calculate_optimal_partitions(spark, total_data_size_gb, ideal_partition_size_mb=64):
-    """计算最优分区数"""
-    total_cores = spark.sparkContext.defaultParallelism
-    # 基于 CPU 核心数确定分区数量
-    partitions_based_on_cores = total_cores * 1.5
-
-    # 基于数据量确定分区数量
-    partitions_based_on_data_size = (total_data_size_gb * 1024) / ideal_partition_size_mb
-
-    # 取两个值的较大者
-    optimal_partitions = max(partitions_based_on_cores, partitions_based_on_data_size)
-    return int(optimal_partitions)
-
 
 def get_data_size_gb(spark, config):
     """估算数据大小，返回单位为GB的大小"""
