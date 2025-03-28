@@ -37,10 +37,10 @@ def parse_args():
     parser.add_argument("--query", type= str, required=True, help="SQL query to execute")
     parser.add_argument("--bucket", type=str, required=True, help="bucket located in OSS")
     parser.add_argument("--dataobject", type= str, required=True, help="data object located in OSS")
-    parser.add_argument("--inobjects", type=str, nargs='+', required=True, help="List of in params object located in OSS")
-    parser.add_argument("--incolumns", type=str, nargs='+', required=True, help="List of columns for IN clause")
+    parser.add_argument("--inobjects", type=str, nargs='+', help="List of in params object located in OSS")
+    parser.add_argument("--incolumns", type=str, nargs='+', help="List of columns for IN clause")
     parser.add_argument("--endpoint", type=str, required=True, help="endpoint in OSS")
-    parser.add_argument("--columns", type=str, nargs='+', required=True, help="List of columns to SELECT")
+    parser.add_argument("--columns", type=str, nargs='+', help="List of columns to SELECT")
     parser.add_argument("--serverip", type=str, help="Data server IP")
     parser.add_argument("--serverport", type=int, help="Data server port")
 
@@ -112,6 +112,7 @@ def notify_server_of_completion(config, object_name, total_rows):
     server_endpoint = f"{config.serverip}:{config.serverport}"
     url = urljoin(f"http://{server_endpoint}", "/api/job/completed")
     payload = {
+        "bucketName": config.bucket,
         "objectName": object_name,
         "totalRows": total_rows
     }
