@@ -107,21 +107,17 @@ class ArrowUploader:
                             id_value = i.as_py()
                         elif isinstance(i, pa.lib.UInt64Array):
                             id_value = i.as_py()
-                        elif isinstance(i, pa.lib.Float32Array):
-                            id_value = i.as_py()
-                        elif isinstance(i, pa.lib.Float64Array):
+                        elif isinstance(i, pa.FloatArray):
                             id_value = i.as_py()
                         elif isinstance(i, pa.lib.StringArray):
                             id_value = i.as_py()  # 字符串
                         elif isinstance(i, pa.lib.BinaryArray):
                             id_value = i.as_py()  # 二进制数据
-                        elif isinstance(i, pa.lib.BoolArray):
-                            id_value = i.as_py()  # 布尔值
                         elif isinstance(i, pa.lib.TimestampArray):
                             id_value = i.as_py()  # 时间戳
-                        elif isinstance(i, pa.lib.DateArray):
+                        elif isinstance(i, pa.lib.Date32Array) or isinstance(i, pa.lib.Date64Array):
                             id_value = i.as_py()  # 日期
-                        elif isinstance(i, pa.lib.TimeArray):
+                        elif isinstance(i, pa.lib.Time32Array) or isinstance(i, pa.lib.Time64Array):
                             id_value = i.as_py()  # 时间
                         elif isinstance(i, pa.lib.ListArray):
                             id_value = i.to_pandas()  # 列表类型

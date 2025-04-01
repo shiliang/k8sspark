@@ -113,8 +113,8 @@ def notify_server_of_completion(config, object_name, total_rows):
     server_endpoint = f"{config.serverip}:{config.serverport}"
     url = urljoin(f"http://{server_endpoint}", "/api/job/completed")
     payload = {
-        "bucketName": config.bucket,
-        "objectName": object_name,
+        "bucket": config.bucket,
+        "object": object_name,
         "totalRows": total_rows
     }
     logger.info(f"Partition URLs and total rows to notify server: {payload}")
@@ -143,7 +143,7 @@ def save_dataframe_to_minio(result, config, arrow_uploader):
 
         # 构造文件名
         unique_id = uuid.uuid4().hex
-        object_name = f"{config.dataobject}_result_{unique_id}.arrow"
+        object_name = f"result_{unique_id}.arrow"
         logger.info(f"Constructed object name: {object_name}")
 
         # 上传 Arrow 表到 MinIO
