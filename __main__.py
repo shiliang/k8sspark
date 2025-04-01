@@ -57,20 +57,16 @@ def run_spark_job(config):
         .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false") \
         .getOrCreate()
 
+    arrow_uploader = ArrowUploader(config.endpoint, config.accesskey, config.secretkey, config.bucket)
+
     try:
         # 读取主数据
-        file_path = f"s3a://{config.bucket}/{config.dataobject}"
-        logger.info(f"read file path: {file_path}")
-        df = spark.read.format("arrow").load(file_path)
-
+        df = read_dataframe_from_minio(arrow_uploader, spark, config.bucket, config.dataobject)
         # 过滤字段数据
         filtered_df = df
 
         for col, inobject in zip(config.incolumns, config.inobjects):
-            filter_path = f"s3a://{config.bucket}/{inobject}"
-            logger.info(f"Reading filter data for column {col} from: {filter_path}")
-            filter_df = spark.read.format("arrow").load(filter_path)
-
+            filter_df = read_dataframe_from_minio(arrow_uploader, spark, config.bucket, inobject)
             # 只选择需要过滤的列
             filter_df = filter_df.select(col)
 
@@ -96,7 +92,7 @@ def run_spark_job(config):
         result = spark.sql(query)
 
         # 将结果上传到minio
-        arrow_uploader = ArrowUploader(config.endpoint, config.accesskey, config.secretkey, config.bucket)
+
         logger.info(f"Initialized ArrowUploader with endpoint: {config.endpoint}, bucket: {config.bucket}")
         # 将查询结果上传到 MinIO
         object_name = save_dataframe_to_minio(result, config, arrow_uploader)
@@ -153,6 +149,9 @@ def save_dataframe_to_minio(result, config, arrow_uploader):
     except Exception as e:
         logger.error(f"Error during Arrow Table conversion or upload to MinIO: {e}")
         return None
+
+def read_dataframe_from_minio(arrow_uploader, spark, bucket, object):
+    return arrow_uploader.read_from_minio(spark, bucket, object)
 
 def get_data_size_gb(spark, config):
     """估算数据大小，返回单位为GB的大小"""

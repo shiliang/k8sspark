@@ -1,9 +1,11 @@
 import logging
+import os
 from datetime import timedelta
 
 from minio import Minio, S3Error
 import pyarrow.ipc as ipc
 import io
+import pyarrow as pa
 
 # 初始化日志
 logging.basicConfig(level=logging.INFO)
@@ -68,3 +70,47 @@ class ArrowUploader:
         except Exception as e:
             logger.error(f"Unexpected error generating presigned URL for {object_name}: {e}")
         return None
+
+    def read_from_minio(self, spark, bucket_name, object_name, schema=None):
+        file_path = os.path.join("/tmp", f"{object_name}_{os.urandom(8).hex()}.arrow")
+        try:
+            self.minio_client.fget_object(bucket_name, object_name, file_path)
+            logger.info(f"Download {object_name} successfully from MinIO to {file_path}.")
+        except S3Error as e:
+            logger.error(f"Error downloading {object_name} from MinIO: {e}")
+
+            # 读取 Arrow 文件的函数
+            def mapper(iterator):
+                with pa.memory_map(file_path, "rb") as source:
+                    f = pa.ipc.open_file(source)
+                    logger.info(f"Arrow file {file_path} opened successfully.")
+                    for batch in iterator:
+                        for i in batch['id']:
+                            logger.debug(f"Processing batch with id: {i.as_py()}")
+                            yield f.get_batch(i.as_py()).to_pandas()
+
+            # 获取 Arrow 文件的总批次数
+            try:
+                tmp_reader = pa.ipc.open_file(file_path)
+                num_batches = tmp_reader.num_record_batches
+                logger.info(f"Arrow file contains {num_batches} batches.")
+            except Exception as e:
+                logger.error(f"Failed to open Arrow file: {e}")
+                raise
+
+            # 如果没有传递 schema，自动推导 schema
+            if schema is None:
+                try:
+                    tmp_row = tmp_reader.get_batch(0)[:1]
+                    schema = spark.createDataFrame(tmp_row.to_pandas()).schema
+                    logger.info("Schema inferred from the first batch.")
+                except Exception as e:
+                    logger.error(f"Failed to infer schema: {e}")
+                    raise
+
+            # 使用 mapInPandas 来转换每个批次
+            logger.info(f"Starting to process batches with inferred schema: {schema}")
+            result_df = spark.range(num_batches).mapInPandas(mapper, schema)
+            logger.info(f"Finished processing Arrow file and returning DataFrame.")
+
+            return result_df
