@@ -20,10 +20,10 @@ class Config:
         self.secretkey = kwargs.get('secretkey', '')
         self.bucket = kwargs.get('bucket', '')
         self.dataobject = kwargs.get('dataobject', '')
-        self.inobject = kwargs.get('inobjects', '') # where xxx in字段对应的数据文件
+        self.inobjects = kwargs.get('inobjects', []) # where xxx in字段对应的数据文件
         self.query = kwargs.get('query', '')
         self.endpoint = kwargs.get('endpoint', '')
-        self.incolumn = kwargs.get('incolumns', []) # where xxx in字段
+        self.incolumns = kwargs.get('incolumns', []) # where xxx in字段
         self.columns = kwargs.get('columns', []) # select字段
         self.serverip = kwargs.get('serverip', '') # 数据组件的地址
         self.serverport = kwargs.get('serverport', 0)
@@ -65,14 +65,22 @@ def run_spark_job(config):
         # 过滤字段数据
         filtered_df = df
 
-        for col, inobject in zip(config.incolumns, config.inobjects):
-            filter_df = read_dataframe_from_minio(arrow_uploader, spark, config.bucket, inobject)
-            # 只选择需要过滤的列
-            filter_df = filter_df.select(col)
+        # 确保 config.incolumns 和 config.inobjects 不为 None
+        if config.incolumns is not None and config.inobjects is not None:
+            # 确保 incolumns 和 inobjects 的长度一致
+            if len(config.incolumns) == len(config.inobjects):
+                for col, inobject in zip(config.incolumns, config.inobjects):
+                    filter_df = read_dataframe_from_minio(arrow_uploader, spark, config.bucket, inobject)
+                    # 只选择需要过滤的列
+                    filter_df = filter_df.select(col)
 
-            # 对主数据进行 JOIN
-            filtered_df = filtered_df.join(filter_df, on=col, how="inner")
-            logger.info(f"Performed join on column {col}")
+                    # 对主数据进行 JOIN
+                    filtered_df = filtered_df.join(filter_df, on=col, how="inner")
+                    logger.info(f"Performed join on column {col}")
+            else:
+                logger.error("Length of incolumns and inobjects do not match.")
+        else:
+            logger.warning("incolumns or inobjects is None, skipping join operation.")
 
         # 注册为临时视图
         filtered_df.createOrReplaceTempView("filtered_table")
@@ -91,12 +99,9 @@ def run_spark_job(config):
         logger.info(f"Executing SQL query: {query}")
         result = spark.sql(query)
 
-        # 将结果上传到minio
-
-        logger.info(f"Initialized ArrowUploader with endpoint: {config.endpoint}, bucket: {config.bucket}")
         # 将查询结果上传到 MinIO
         object_name = save_dataframe_to_minio(result, config, arrow_uploader)
-
+        logger.info(f"DataFrame successfully uploaded to MinIO as {object_name}, row count: {result.count()}.")
         # 通知服务端
         notify_server_of_completion(config, object_name, result.count())
     except Exception as e:
