@@ -8,7 +8,7 @@ from pyspark.sql import SparkSession
 from urllib.parse import urljoin
 
 from src.arrow_uploader import ArrowUploader
-from src.database_strategy import DatabaseStrategy  # Import existing DatabaseStrategy
+from src.DatabaseStrategy import DatabaseStrategy
 
 # 初始化日志
 logging.basicConfig(level=logging.INFO)
@@ -25,6 +25,7 @@ class Config:
         self.query = kwargs.get('query', '')
         self.endpoint = kwargs.get('endpoint', '')
         self.incolumns = kwargs.get('incolumns', []) # Fields for where xxx in clause
+        self.oncolumns = kwargs.get('oncolumns', []) # Fields for on xxx = xxx clause
         self.columns = kwargs.get('columns', []) # Fields to select
         self.serverip = kwargs.get('serverip', '') # Data component address
         self.serverport = kwargs.get('serverport', 0)
@@ -38,9 +39,13 @@ class Config:
         # Add mode parameter
         self.mode = kwargs.get('mode', 'query')  # Default to query mode
         # Add group by columns parameter
-        self.groupby_columns = kwargs.get('groupby_columns', [])
+        self.groupby_columns = kwargs.get('groupby_columns', []) # 已经是数组
         # Add where condition parameter
-        self.where_condition = kwargs.get('where_condition', '')
+        self.where_condition = kwargs.get('where_condition', []) # 改为数组
+        # Add join related parameters
+        self.join_type = kwargs.get('join_type', 'inner')
+        self.join_columns = kwargs.get('join_columns', [])
+        self.db_table = kwargs.get('db_table', '')
 
 
 def parse_args():
@@ -48,18 +53,19 @@ def parse_args():
 
     # Add mode parameter
     parser.add_argument("--mode", type=str, required=True, 
-                       choices=["query", "write", "sort", "count", "groupby_count"], 
-                       help="Operation mode: query, write, sort, count, or groupby_count")
+                       choices=["query", "write", "sort", "count", "groupby_count", "join"], 
+                       help="Operation mode: query, write, sort, count, groupby_count, or join")
 
-    parser.add_argument("--accesskey", type= str, help="OSS access key")
-    parser.add_argument("--secretkey", type= str, help="OSS secret key")
-    parser.add_argument("--query", type= str, help="SQL query to execute")
+    parser.add_argument("--accesskey", type=str, help="OSS access key")
+    parser.add_argument("--secretkey", type=str, help="OSS secret key")
+    parser.add_argument("--query", type=str, help="SQL query to execute")
     parser.add_argument("--bucket", type=str, required=True, help="Bucket located in OSS")
-    parser.add_argument("--dataobject", type= str, help="Data object located in OSS")
-    parser.add_argument("--inobjects", type=str, nargs='+', help="List of in params object located in OSS")
-    parser.add_argument("--incolumns", type=str, nargs='+', help="List of columns for IN clause")
+    parser.add_argument("--dataobject", type=str, help="Data object located in OSS")
+    parser.add_argument("--inobjects", type=str, help="List of in params object located in OSS (comma-separated)")
+    parser.add_argument("--incolumns", type=str, help="List of columns for IN clause (comma-separated)")
+    parser.add_argument("--oncolumns", type=str, help="List of columns for ON clause (comma-separated)")
     parser.add_argument("--endpoint", type=str, required=True, help="Endpoint in OSS")
-    parser.add_argument("--columns", type=str, nargs='+', help="List of columns to SELECT")
+    parser.add_argument("--columns", type=str, help="List of columns to SELECT (comma-separated)")
     parser.add_argument("--serverip", type=str, help="Data server IP")
     parser.add_argument("--serverport", type=int, help="Data server port")
     # New database related parameters
@@ -70,17 +76,38 @@ def parse_args():
     parser.add_argument("--password", type=str, help="Database password")
     parser.add_argument("--dbName", type=str, help="Database name")
     # Add group by columns parameter
-    parser.add_argument("--groupby_columns", type=str, nargs='+', help="Columns for GROUP BY clause")
+    parser.add_argument("--groupby_columns", type=str, help="Columns for GROUP BY clause (comma-separated)")
     # Add where condition parameter
-    parser.add_argument("--where_condition", type=str, help="WHERE condition for filtering data")
+    parser.add_argument("--where_condition", type=str, help="WHERE condition for filtering data (comma-separated)")
+    # Add join related parameters
+    parser.add_argument("--join_type", type=str, choices=["inner", "left", "right", "outer"], default="inner", help="Join type")
+    parser.add_argument("--join_columns", type=str, help="Columns to join on (comma-separated)")
+    parser.add_argument("--db_table", type=str, help="Database table name for join")
 
     args = parser.parse_args()
+    
+    # Convert comma-separated strings to lists
+    if args.inobjects:
+        args.inobjects = args.inobjects.split(',')
+    if args.incolumns:
+        args.incolumns = args.incolumns.split(',')
+    if args.oncolumns:
+        args.oncolumns = args.oncolumns.split(',')
+    if args.columns:
+        args.columns = args.columns.split(',')
+    if args.groupby_columns:
+        args.groupby_columns = args.groupby_columns.split(',')
+    if args.where_condition:
+        args.where_condition = args.where_condition.split(',')
+    if args.join_columns:
+        args.join_columns = args.join_columns.split(',')
+    
     return Config(**vars(args))
 
 
 def run_spark_job(config):
     spark = SparkSession.builder \
-        .appName("Minio Arrow Example") \
+        .appName("DynamicDatabaseJob") \
         .config("spark.hadoop.fs.s3a.access.key", config.accesskey) \
         .config("spark.hadoop.fs.s3a.secret.key", config.secretkey) \
         .config("spark.hadoop.fs.s3a.endpoint", config.endpoint) \
@@ -96,6 +123,8 @@ def run_spark_job(config):
             do_write(spark, config, arrow_uploader)
         elif config.mode == "sort":
             do_sort(spark, config, arrow_uploader)
+        elif config.mode == "join":
+            do_join(spark, config, arrow_uploader)
         elif config.mode == "count":
             do_count(spark, config, arrow_uploader)
         elif config.mode == "groupby_count":
@@ -255,6 +284,42 @@ def do_groupby_count(spark, config, arrow_uploader):
     logger.info(f"Group by count result uploaded to MinIO as {object_name}")
     notify_server_of_completion(config, object_name, result_df.count())
 
+def do_join(spark, config, arrow_uploader):
+    """Execute join operation between database table and MinIO file"""
+    if not config.db_table:
+        raise ValueError("db_table parameter is required for join mode")
+    if not config.dataobject:
+        raise ValueError("dataobject parameter is required for join mode")
+    if not config.oncolumns:
+        raise ValueError("oncolumns parameter is required for join mode")
+    if not config.dbType:
+        raise ValueError("dbType parameter is required for join mode")
+    
+    # 获取数据库驱动和URL
+    driver = DatabaseStrategy.get_driver(config.dbType)
+    url = DatabaseStrategy.get_url(config.dbType, config.host, config.port, config.dbName)
+    
+    # 读取数据库表
+    db_df = spark.read \
+        .format("jdbc") \
+        .option("url", url) \
+        .option("driver", driver) \
+        .option("dbtable", config.db_table) \
+        .option("user", config.username) \
+        .option("password", config.password) \
+        .load()
+    
+    # 读取MinIO文件
+    minio_df = read_dataframe_from_minio(arrow_uploader, spark, config.bucket, config.minio_file)
+    
+    # 执行join
+    join_condition = " AND ".join([f"db_df.{col} = minio_df.{col}" for col in config.join_columns])
+    result_df = db_df.join(minio_df, expr(join_condition), config.join_type)
+    
+    # 保存结果到MinIO
+    object_name = save_dataframe_to_minio(result_df, config, arrow_uploader)
+    logger.info(f"Join result uploaded to MinIO as {object_name}")
+    notify_server_of_completion(config, object_name, result_df.count())
 
 def notify_server_of_completion(config, object_name, total_rows):
     server_endpoint = f"{config.serverip}:{config.serverport}"
