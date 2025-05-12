@@ -54,10 +54,9 @@ class DatabaseFactory:
 
     @staticmethod
     def get_strategy(db_type: str, host: str, port: int, database: str, username: str, password: str) -> DatabaseStrategy:
-        db_type = db_type.lower()
-        if db_type == "kingbase":
-            return KingbaseStrategy(host, port, database, username, password)
-        elif db_type == "mysql":
+        if db_type == "1":
             return MySQLStrategy(host, port, database, username, password)
+        elif db_type == "2":
+            return KingbaseStrategy(host, port, database, username, password)
         else:
             raise ValueError("Unknown database type")

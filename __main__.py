@@ -6,9 +6,10 @@ import requests
 import pyarrow as pa
 from pyspark.sql import SparkSession
 from urllib.parse import urljoin
+from pyspark.sql.functions import expr
 
 from src.arrow_uploader import ArrowUploader
-from src.DatabaseStrategy import DatabaseStrategy
+from src.DatabaseStrategy import DatabaseFactory
 
 # 初始化日志
 logging.basicConfig(level=logging.INFO)
@@ -25,7 +26,6 @@ class Config:
         self.query = kwargs.get('query', '')
         self.endpoint = kwargs.get('endpoint', '')
         self.incolumns = kwargs.get('incolumns', []) # Fields for where xxx in clause
-        self.oncolumns = kwargs.get('oncolumns', []) # Fields for on xxx = xxx clause
         self.columns = kwargs.get('columns', []) # Fields to select
         self.serverip = kwargs.get('serverip', '') # Data component address
         self.serverport = kwargs.get('serverport', 0)
@@ -63,7 +63,6 @@ def parse_args():
     parser.add_argument("--dataobject", type=str, help="Data object located in OSS")
     parser.add_argument("--inobjects", type=str, help="List of in params object located in OSS (comma-separated)")
     parser.add_argument("--incolumns", type=str, help="List of columns for IN clause (comma-separated)")
-    parser.add_argument("--oncolumns", type=str, help="List of columns for ON clause (comma-separated)")
     parser.add_argument("--endpoint", type=str, required=True, help="Endpoint in OSS")
     parser.add_argument("--columns", type=str, help="List of columns to SELECT (comma-separated)")
     parser.add_argument("--serverip", type=str, help="Data server IP")
@@ -91,8 +90,6 @@ def parse_args():
         args.inobjects = args.inobjects.split(',')
     if args.incolumns:
         args.incolumns = args.incolumns.split(',')
-    if args.oncolumns:
-        args.oncolumns = args.oncolumns.split(',')
     if args.columns:
         args.columns = args.columns.split(',')
     if args.groupby_columns:
@@ -198,15 +195,21 @@ def do_write(spark, config, arrow_uploader):
     # 读取数据
     df = read_dataframe_from_minio(arrow_uploader, spark, config.bucket, config.dataobject)
     
-    # 获取数据库驱动和URL
-    driver = DatabaseStrategy.get_driver(config.dbType)
-    url = DatabaseStrategy.get_url(config.dbType, config.host, config.port, config.dbName)
+    # 获取数据库策略
+    db_strategy = DatabaseFactory.get_strategy(
+        config.dbType, 
+        config.host, 
+        config.port, 
+        config.dbName, 
+        config.username, 
+        config.password
+    )
     
     # 写入到数据库
     df.write \
         .format("jdbc") \
-        .option("url", url) \
-        .option("driver", driver) \
+        .option("url", db_strategy.get_jdbc_url()) \
+        .option("driver", db_strategy.get_driver()) \
         .option("dbtable", "target_table") \
         .option("user", config.username) \
         .option("password", config.password) \
@@ -296,21 +299,27 @@ def do_join(spark, config, arrow_uploader):
         raise ValueError("dbType parameter is required for join mode")
     
     # 获取数据库驱动和URL
-    driver = DatabaseStrategy.get_driver(config.dbType)
-    url = DatabaseStrategy.get_url(config.dbType, config.host, config.port, config.dbName)
+    db_strategy = DatabaseFactory.get_strategy(
+        config.dbType, 
+        config.host, 
+        config.port, 
+        config.dbName, 
+        config.username, 
+        config.password
+    )
     
     # 读取数据库表
     db_df = spark.read \
         .format("jdbc") \
-        .option("url", url) \
-        .option("driver", driver) \
+        .option("url", db_strategy.get_jdbc_url()) \
+        .option("driver", db_strategy.get_driver()) \
         .option("dbtable", config.db_table) \
         .option("user", config.username) \
         .option("password", config.password) \
         .load()
     
     # 读取MinIO文件
-    minio_df = read_dataframe_from_minio(arrow_uploader, spark, config.bucket, config.minio_file)
+    minio_df = read_dataframe_from_minio(arrow_uploader, spark, config.bucket, config.dataobject)
     
     # 执行join
     join_condition = " AND ".join([f"db_df.{col} = minio_df.{col}" for col in config.join_columns])
@@ -375,10 +384,21 @@ def read_dataframe_from_minio(arrow_uploader, spark, bucket, object):
 
 def get_data_size_gb(spark, config):
     """Estimate data size, return size in GB"""
+    # 获取数据库策略
+    db_strategy = DatabaseFactory.get_strategy(
+        config.dbType, 
+        config.host, 
+        config.port, 
+        config.dbName, 
+        config.username, 
+        config.password
+    )
+    
     # Read data to estimate size
     df = spark.read \
         .format("jdbc") \
-        .option("url", f"jdbc:{config.dbType}://{config.host}:{config.port}/{config.dbName}") \
+        .option("url", db_strategy.get_jdbc_url()) \
+        .option("driver", db_strategy.get_driver()) \
         .option("dbtable", f"({config.query.strip(';')}) AS subquery") \
         .load()
 
