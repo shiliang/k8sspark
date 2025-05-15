@@ -36,6 +36,14 @@ class Config:
         self.username = kwargs.get('username', '')
         self.password = kwargs.get('password', '')
         self.dbName = kwargs.get('dbName', '')
+        # 内置数据库
+        self.embedded_dbType = kwargs.get('embedded_dbType', '')
+        self.embedded_host = kwargs.get('embedded_host', '')
+        self.embedded_port = kwargs.get('embedded_port', 0)
+        self.embedded_username = kwargs.get('embedded_username', '')
+        self.embedded_password = kwargs.get('embedded_password', '')
+        self.embedded_dbName = kwargs.get('embedded_dbName', '')
+        self.embedded_table = kwargs.get('embedded_table', '')
         # Add mode parameter
         self.mode = kwargs.get('mode', 'query')  # Default to query mode
         # Add group by columns parameter
@@ -46,6 +54,7 @@ class Config:
         self.join_type = kwargs.get('join_type', 'inner')
         self.join_columns = kwargs.get('join_columns', [])
         self.db_table = kwargs.get('db_table', '')
+        self.partitions = kwargs.get('partitions', None)
 
 
 def parse_args():
@@ -74,6 +83,14 @@ def parse_args():
     parser.add_argument("--username", type=str, help="Database username")
     parser.add_argument("--password", type=str, help="Database password")
     parser.add_argument("--dbName", type=str, help="Database name")
+    # embedded database related parameters
+    parser.add_argument("--embedded_dbType", type=str, choices=["1", "2"], help="Database type (1 for MySQL, 2 for KingBase)")
+    parser.add_argument("--embedded_host", type=str, help="Database host address")
+    parser.add_argument("--embedded_port", type=int, help="Database port")
+    parser.add_argument("--embedded_username", type=str, help="Database username")
+    parser.add_argument("--embedded_password", type=str, help="Database password")
+    parser.add_argument("--embedded_dbName", type=str, help="Database name")
+    parser.add_argument("--embedded_table", type=str, help="Database table name")
     # Add group by columns parameter
     parser.add_argument("--groupby_columns", type=str, help="Columns for GROUP BY clause (comma-separated)")
     # Add where condition parameter
@@ -82,6 +99,8 @@ def parse_args():
     parser.add_argument("--join_type", type=str, choices=["inner", "left", "right", "outer"], default="inner", help="Join type")
     parser.add_argument("--join_columns", type=str, help="Columns to join on (comma-separated)")
     parser.add_argument("--db_table", type=str, help="Database table name for join")
+    parser.add_argument("--partitions", type=int,
+                        help="Number of partitions to use (optional, will calculate if not provided)")
 
     args = parser.parse_args()
     
@@ -179,7 +198,7 @@ def do_query(spark, config, arrow_uploader):
     result = spark.sql(query)
 
     # 将查询结果上传到 MinIO
-    object_name = save_dataframe_to_minio(result, config, arrow_uploader)
+    object_name = save_dataframe_to_minio_distributed(result, config)
     logger.info(f"DataFrame successfully uploaded to MinIO as {object_name}, row count: {result.count()}.")
     # 通知服务端
     notify_server_of_completion(config, object_name, result.count())
@@ -192,10 +211,7 @@ def do_write(spark, config, arrow_uploader):
     if not config.dbType:
         raise ValueError("dbType parameter is required for write mode")
     
-    # 读取数据
-    df = read_dataframe_from_minio(arrow_uploader, spark, config.bucket, config.dataobject)
-    
-    # 获取数据库策略
+    # 读取数据资产的表数据
     db_strategy = DatabaseFactory.get_strategy(
         config.dbType, 
         config.host, 
@@ -205,16 +221,41 @@ def do_write(spark, config, arrow_uploader):
         config.password
     )
     
+    # 构建连接参数
+    jdbc_properties = {
+        "user": config.username,
+        "password": config.password,
+        "driver": db_strategy.get_driver()
+    }
+    
+    # 设置分区数，如果未指定则默认为10
+    num_partitions = config.partitions if config.partitions else 10
+    
+    # 取第一个join列作为分区键
+    join_column = config.join_columns[0]
+    
+    # 创建谓词分区 - 组合使用MOD和CRC32
+    predicates = []
+    for i in range(num_partitions):
+        # 对于最后一个分区，使用 >= 确保不漏数据
+        if i == num_partitions - 1:
+            predicates.append(f"MOD(ABS(CRC32({join_column})), {num_partitions}) >= {i}")
+        else:
+            predicates.append(f"MOD(ABS(CRC32({join_column})), {num_partitions}) = {i}")
+    
+    # 使用日志记录谓词
+    logger.info(f"Using predicates for partitioned reading: {predicates}")
+    
+    # 使用谓词分区读取数据库
+    db_df = spark.read.jdbc(
+        url=db_strategy.get_jdbc_url(),
+        table=config.db_table,
+        predicates=predicates,
+        properties=jdbc_properties
+    )
+    
     # 写入到数据库
-    df.write \
-        .format("jdbc") \
-        .option("url", db_strategy.get_jdbc_url()) \
-        .option("driver", db_strategy.get_driver()) \
-        .option("dbtable", "target_table") \
-        .option("user", config.username) \
-        .option("password", config.password) \
-        .mode("append") \
-        .save()
+    save_dataframe_to_embedded_database(db_df, config)
     
     logger.info("Data successfully written to database")
 
@@ -233,7 +274,7 @@ def do_sort(spark, config, arrow_uploader):
     sorted_df = df.sort(*config.columns)
     
     # 保存排序结果
-    object_name = save_dataframe_to_minio(sorted_df, config, arrow_uploader)
+    object_name = save_dataframe_to_minio_distributed(sorted_df, config)
     logger.info(f"Sorted data successfully uploaded to MinIO as {object_name}")
     notify_server_of_completion(config, object_name, sorted_df.count())
 
@@ -259,7 +300,7 @@ def do_count(spark, config, arrow_uploader):
     result_df = spark.createDataFrame([(row_count,)], ["count"])
     
     # 保存结果到MinIO
-    object_name = save_dataframe_to_minio(result_df, config, arrow_uploader)
+    object_name = save_dataframe_to_minio_distributed(result_df, config)
     logger.info(f"Count result uploaded to MinIO as {object_name}")
     notify_server_of_completion(config, object_name, 1)  # 1 row in result
 
@@ -283,7 +324,7 @@ def do_groupby_count(spark, config, arrow_uploader):
     result_df = df.groupBy(*config.groupby_columns).count()
     
     # 保存结果到MinIO
-    object_name = save_dataframe_to_minio(result_df, config, arrow_uploader)
+    object_name = save_dataframe_to_minio_distributed(result_df, config)
     logger.info(f"Group by count result uploaded to MinIO as {object_name}")
     notify_server_of_completion(config, object_name, result_df.count())
 
@@ -293,8 +334,8 @@ def do_join(spark, config, arrow_uploader):
         raise ValueError("db_table parameter is required for join mode")
     if not config.dataobject:
         raise ValueError("dataobject parameter is required for join mode")
-    if not config.oncolumns:
-        raise ValueError("oncolumns parameter is required for join mode")
+    if not config.join_columns:
+        raise ValueError("join_columns parameter is required for join mode")
     if not config.dbType:
         raise ValueError("dbType parameter is required for join mode")
     
@@ -308,26 +349,50 @@ def do_join(spark, config, arrow_uploader):
         config.password
     )
     
-    # 读取数据库表
-    db_df = spark.read \
-        .format("jdbc") \
-        .option("url", db_strategy.get_jdbc_url()) \
-        .option("driver", db_strategy.get_driver()) \
-        .option("dbtable", config.db_table) \
-        .option("user", config.username) \
-        .option("password", config.password) \
-        .load()
+    # 构建连接参数
+    jdbc_properties = {
+        "user": config.username,
+        "password": config.password,
+        "driver": db_strategy.get_driver()
+    }
+    
+    # 设置分区数，如果未指定则默认为10
+    num_partitions = config.partitions if config.partitions else 10
+    
+    # 取第一个join列作为分区键
+    join_column = config.join_columns[0]
+    
+    # 创建谓词分区 - 组合使用MOD和CRC32
+    predicates = []
+    for i in range(num_partitions):
+        # 对于最后一个分区，使用 >= 确保不漏数据
+        if i == num_partitions - 1:
+            predicates.append(f"MOD(ABS(CRC32({join_column})), {num_partitions}) >= {i}")
+        else:
+            predicates.append(f"MOD(ABS(CRC32({join_column})), {num_partitions}) = {i}")
+    
+    # 使用日志记录谓词
+    logger.info(f"Using predicates for partitioned reading: {predicates}")
+    
+    # 使用谓词分区读取数据库
+    db_df = spark.read.jdbc(
+        url=db_strategy.get_jdbc_url(),
+        table=config.db_table,
+        predicates=predicates,
+        properties=jdbc_properties
+    )
     
     # 读取MinIO文件
     minio_df = read_dataframe_from_minio(arrow_uploader, spark, config.bucket, config.dataobject)
     
-    # 执行join
-    join_condition = " AND ".join([f"db_df.{col} = minio_df.{col}" for col in config.join_columns])
-    result_df = db_df.join(minio_df, expr(join_condition), config.join_type)
+    # 执行join操作
+    if len(config.join_columns) == 1:
+        result_df = db_df.join(minio_df, on=config.join_columns[0], how=config.join_type)
+    else:
+        result_df = db_df.join(minio_df, on=config.join_columns, how=config.join_type)
     
     # 保存结果到MinIO
-    object_name = save_dataframe_to_minio(result_df, config, arrow_uploader)
-    logger.info(f"Join result uploaded to MinIO as {object_name}")
+    object_name = save_dataframe_to_embedded_database(result_df, config)
     notify_server_of_completion(config, object_name, result_df.count())
 
 def notify_server_of_completion(config, object_name, total_rows):
@@ -346,37 +411,132 @@ def notify_server_of_completion(config, object_name, total_rows):
         logger.error(f"Failed to notify server: {e}")
 
 
-def save_dataframe_to_minio(result, config, arrow_uploader):
+def save_dataframe_to_minio_distributed(result, config):
+    """将DataFrame的每个分区保存为独立的Arrow文件到MinIO的data/目录下"""
+    # 生成唯一标识前缀
+    unique_id = uuid.uuid4().hex
+    data_directory = "data/"  # 指定存储目录
+    result_prefix = f"{data_directory}result_{unique_id}_part"
+    
+    # 定义分区处理函数 - 直接将每个分区保存为最终文件
+    def process_and_save_partition(partition_id, iterator):
+        import pandas as pd
+        import pyarrow as pa
+        from src.arrow_uploader import ArrowUploader
+        
+        # 在每个分区中创建上传器
+        part_uploader = ArrowUploader(
+            config.endpoint, config.accesskey, config.secretkey, config.bucket
+        )
+        
+        # 处理分区数据
+        rows = list(iterator)
+        if not rows:
+            return []
+        
+        pdf = pd.DataFrame(rows)
+        if pdf.empty:
+            return []
+            
+        # 转换为Arrow表
+        table = pa.Table.from_pandas(pdf)
+        
+        # 最终文件命名 (直接保存在data/目录)
+        file_name = f"{result_prefix}{partition_id}.arrow"
+        
+        # 使用save_to_minio直接保存最终文件
+        part_uploader.save_to_minio(table, file_name)
+        
+        return [file_name]
+    
+    # 分布式处理并直接保存最终文件
+    file_names = result.rdd.mapPartitionsWithIndex(
+        process_and_save_partition
+    ).collect()
+    
+    # 展平文件名列表
+    flat_files = [name for files in file_names for name in files]
+    
+    if not flat_files:
+        logger.warning("No data was saved - result DataFrame may be empty")
+        return None
+    
+    # 记录所有保存的文件名，便于追踪
+    logger.info(f"Saved {len(flat_files)} Arrow files with prefix {result_prefix}")
+    
+    # 返回第一个文件名，或者文件名前缀
+    first_file = flat_files[0] if flat_files else None
+    logger.info(f"Returning reference file: {first_file}")
+    return first_file
+
+def save_dataframe_to_embedded_database(result, config):
     """
-    Convert Spark DataFrame to Arrow table and upload to MinIO.
+    将Spark DataFrame保存到内置数据库（如SQLite、H2、Derby、HSQLDB）
 
     Args:
-        result (DataFrame): Spark SQL query result DataFrame.
-        config (Config): Configuration object.
-        arrow_uploader (ArrowUploader): ArrowUploader instance for uploading to MinIO.
+        result: Spark DataFrame
+        config: 配置对象，需包含embedded_dbType、embedded_dbName等参数
 
     Returns:
-        str: Object name uploaded to MinIO.
+        str: 实际写入的表名
     """
+    # 参数校验
+    if not config.embedded_dbType:
+        raise ValueError("embedded_dbType 参数不能为空")
+    if not config.embedded_dbName:
+        raise ValueError("embedded_dbName 参数不能为空")
+
+    # 表名
+    target_table = config.embedded_table
+    if not target_table:
+        import uuid
+        target_table = f"result_{uuid.uuid4().hex[:8]}"
+        logger.info(f"未指定表名，自动生成表名: {target_table}")
+
+    # 获取数据库驱动和URL
+    db_strategy = DatabaseFactory.get_strategy(
+        config.embedded_dbType, 
+        config.embedded_host, 
+        config.embedded_port, 
+        config.embedded_dbName, 
+        config.embedded_username, 
+        config.embedded_password
+    )
+    jdbc_url = db_strategy.get_jdbc_url()
+
+    # 构建连接参数
+    jdbc_properties = {
+        "driver": db_strategy.get_driver()
+    }
+    if config.embedded_username:
+        jdbc_properties["user"] = config.embedded_username
+    if config.embedded_password:
+        jdbc_properties["password"] = config.embedded_password
+
+    # 写入模式
+    write_mode = "overwrite"  # 也可以根据需要改为"append"
+
     try:
-        # Convert result DataFrame to Arrow table
-        logger.info("Converting query result to Arrow Table")
-        result_arrow = pa.Table.from_pandas(result.toPandas())  # Convert Spark DataFrame to Pandas DataFrame, then to Arrow table
+        logger.info(f"写入DataFrame到内置数据库表: {target_table}")
+        logger.info(f"JDBC URL: {jdbc_url}")
+        logger.info(f"JDBC属性: {jdbc_properties}")
 
-        # Construct filename
-        unique_id = uuid.uuid4().hex
-        object_name = f"result_{unique_id}.arrow"
-        logger.info(f"Constructed object name: {object_name}")
+        result.write \
+            .format("jdbc") \
+            .option("url", jdbc_url) \
+            .option("dbtable", target_table) \
+            .mode(write_mode) \
+            .options(**jdbc_properties) \
+            .save()
 
-        # Upload Arrow table to MinIO
-        arrow_uploader.save_to_minio(result_arrow, object_name)
-
-        # Return object name
-        return object_name
+        row_count = result.count()
+        logger.info(f"成功写入 {row_count} 行到表 {target_table}")
+        return target_table
     except Exception as e:
-        logger.error(f"Error during Arrow Table conversion or upload to MinIO: {e}")
+        logger.error(f"写入内置数据库失败: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return None
-
 
 def read_dataframe_from_minio(arrow_uploader, spark, bucket, object):
     return arrow_uploader.read_from_minio(spark, bucket, object)
