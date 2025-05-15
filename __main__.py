@@ -199,9 +199,12 @@ def do_query(spark, config, arrow_uploader):
 
     # 将查询结果上传到 MinIO
     object_name = save_dataframe_to_minio_distributed(result, config)
+    if object_name is None:
+        raise Exception("Failed to save result to MinIO")
+    
     logger.info(f"DataFrame successfully uploaded to MinIO as {object_name}, row count: {result.count()}.")
     # 通知服务端
-    notify_server_of_completion(config, object_name, result.count())
+    notify_server_of_completion(config)
 
 
 def do_write(spark, config, arrow_uploader):
@@ -275,8 +278,11 @@ def do_sort(spark, config, arrow_uploader):
     
     # 保存排序结果
     object_name = save_dataframe_to_minio_distributed(sorted_df, config)
+    if object_name is None:
+        raise Exception("Failed to save sorted result to MinIO")
+    
     logger.info(f"Sorted data successfully uploaded to MinIO as {object_name}")
-    notify_server_of_completion(config, object_name, sorted_df.count())
+    notify_server_of_completion(config)
 
 
 def do_count(spark, config, arrow_uploader):
@@ -301,8 +307,11 @@ def do_count(spark, config, arrow_uploader):
     
     # 保存结果到MinIO
     object_name = save_dataframe_to_minio_distributed(result_df, config)
+    if object_name is None:
+        raise Exception("Failed to save count result to MinIO")
+    
     logger.info(f"Count result uploaded to MinIO as {object_name}")
-    notify_server_of_completion(config, object_name, 1)  # 1 row in result
+    notify_server_of_completion(config)
 
 
 def do_groupby_count(spark, config, arrow_uploader):
@@ -325,85 +334,103 @@ def do_groupby_count(spark, config, arrow_uploader):
     
     # 保存结果到MinIO
     object_name = save_dataframe_to_minio_distributed(result_df, config)
+    if object_name is None:
+        raise Exception("Failed to save groupby count result to MinIO")
+    
     logger.info(f"Group by count result uploaded to MinIO as {object_name}")
-    notify_server_of_completion(config, object_name, result_df.count())
+    notify_server_of_completion(config)
 
 def do_join(spark, config, arrow_uploader):
     """Execute join operation between database table and MinIO file"""
-    if not config.db_table:
-        raise ValueError("db_table parameter is required for join mode")
-    if not config.dataobject:
-        raise ValueError("dataobject parameter is required for join mode")
-    if not config.join_columns:
-        raise ValueError("join_columns parameter is required for join mode")
-    if not config.dbType:
-        raise ValueError("dbType parameter is required for join mode")
-    
-    # 获取数据库驱动和URL
-    db_strategy = DatabaseFactory.get_strategy(
-        config.dbType, 
-        config.host, 
-        config.port, 
-        config.dbName, 
-        config.username, 
-        config.password
-    )
-    
-    # 构建连接参数
-    jdbc_properties = {
-        "user": config.username,
-        "password": config.password,
-        "driver": db_strategy.get_driver()
-    }
-    
-    # 设置分区数，如果未指定则默认为10
-    num_partitions = config.partitions if config.partitions else 10
-    
-    # 取第一个join列作为分区键
-    join_column = config.join_columns[0]
-    
-    # 创建谓词分区 - 组合使用MOD和CRC32
-    predicates = []
-    for i in range(num_partitions):
-        # 对于最后一个分区，使用 >= 确保不漏数据
-        if i == num_partitions - 1:
-            predicates.append(f"MOD(ABS(CRC32({join_column})), {num_partitions}) >= {i}")
+    try:
+        if not config.db_table:
+            raise ValueError("db_table parameter is required for join mode")
+        if not config.dataobject:
+            raise ValueError("dataobject parameter is required for join mode")
+        if not config.join_columns:
+            raise ValueError("join_columns parameter is required for join mode")
+        if not config.dbType:
+            raise ValueError("dbType parameter is required for join mode")
+        
+        # 获取数据库驱动和URL
+        db_strategy = DatabaseFactory.get_strategy(
+            config.dbType, 
+            config.host, 
+            config.port, 
+            config.dbName, 
+            config.username, 
+            config.password
+        )
+        
+        # 构建连接参数
+        jdbc_properties = {
+            "user": config.username,
+            "password": config.password,
+            "driver": db_strategy.get_driver()
+        }
+        
+        # 设置分区数，如果未指定则默认为10
+        num_partitions = config.partitions if config.partitions else 10
+        
+        # 取第一个join列作为分区键
+        join_column = config.join_columns[0]
+        
+        # 创建谓词分区 - 组合使用MOD和CRC32
+        predicates = []
+        for i in range(num_partitions):
+            # 对于最后一个分区，使用 >= 确保不漏数据
+            if i == num_partitions - 1:
+                predicates.append(f"MOD(ABS(CRC32({join_column})), {num_partitions}) >= {i}")
+            else:
+                predicates.append(f"MOD(ABS(CRC32({join_column})), {num_partitions}) = {i}")
+        
+        # 使用日志记录谓词
+        logger.info(f"Using predicates for partitioned reading: {predicates}")
+        
+        # 使用谓词分区读取数据库
+        db_df = spark.read.jdbc(
+            url=db_strategy.get_jdbc_url(),
+            table=config.db_table,
+            predicates=predicates,
+            properties=jdbc_properties
+        )
+        
+        # 读取MinIO文件
+        minio_df = read_dataframe_from_minio(arrow_uploader, spark, config.bucket, config.dataobject)
+        
+        # 执行join操作
+        if len(config.join_columns) == 1:
+            result_df = db_df.join(minio_df, on=config.join_columns[0], how=config.join_type)
         else:
-            predicates.append(f"MOD(ABS(CRC32({join_column})), {num_partitions}) = {i}")
-    
-    # 使用日志记录谓词
-    logger.info(f"Using predicates for partitioned reading: {predicates}")
-    
-    # 使用谓词分区读取数据库
-    db_df = spark.read.jdbc(
-        url=db_strategy.get_jdbc_url(),
-        table=config.db_table,
-        predicates=predicates,
-        properties=jdbc_properties
-    )
-    
-    # 读取MinIO文件
-    minio_df = read_dataframe_from_minio(arrow_uploader, spark, config.bucket, config.dataobject)
-    
-    # 执行join操作
-    if len(config.join_columns) == 1:
-        result_df = db_df.join(minio_df, on=config.join_columns[0], how=config.join_type)
-    else:
-        result_df = db_df.join(minio_df, on=config.join_columns, how=config.join_type)
-    
-    # 保存结果到MinIO
-    object_name = save_dataframe_to_embedded_database(result_df, config)
-    notify_server_of_completion(config, object_name, result_df.count())
+            result_df = db_df.join(minio_df, on=config.join_columns, how=config.join_type)
+        
+        # 保存结果到中间数据库
+        target_table = save_dataframe_to_embedded_database(result_df, config)
+        if target_table is None:
+            raise Exception("Failed to save join result to database")
+        
+        notify_server_of_completion(config)
+        
+    except Exception as e:
+        logger.error(f"Error in join operation: {str(e)}")
+        notify_server_of_completion(config, error=str(e))
+        raise
 
-def notify_server_of_completion(config, object_name, total_rows):
+def notify_server_of_completion(config, error=None):
     server_endpoint = f"{config.serverip}:{config.serverport}"
     url = urljoin(f"http://{server_endpoint}", "/api/job/completed")
     payload = {
-        "bucket": config.bucket,
-        "object": object_name,
-        "totalRows": total_rows
+        "dbName": config.embedded_dbName,
+        "tableName": config.embedded_table,
     }
+    # 如果有错误信息，添加到payload中
+    if error:
+        payload["error"] = error
+        payload["status"] = "error"
+    else:
+        payload["status"] = "success"
     logger.info(f"Partition URLs and total rows to notify server: {payload}")
+
     try:
         response = requests.post(url, json=payload, headers={'Content-Type': 'application/json'})
         logger.info(f"Server notification response: {response.text}")
