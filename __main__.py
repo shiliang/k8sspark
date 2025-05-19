@@ -62,8 +62,8 @@ def parse_args():
 
     # Add mode parameter
     parser.add_argument("--mode", type=str, required=True, 
-                       choices=["query", "write", "sort", "count", "groupby_count", "join"], 
-                       help="Operation mode: query, write, sort, count, groupby_count, or join")
+                       choices=["query", "write", "sort", "count", "groupby_count", "join", "add_hash_column"], 
+                       help="Operation mode: query, write, sort, count, groupby_count, join, or add_hash_column")
 
     parser.add_argument("--accesskey", type=str, help="OSS access key")
     parser.add_argument("--secretkey", type=str, help="OSS secret key")
@@ -145,6 +145,8 @@ def run_spark_job(config):
             do_count(spark, config, arrow_uploader)
         elif config.mode == "groupby_count":
             do_groupby_count(spark, config, arrow_uploader)
+        elif config.mode == "add_hash_column":
+            do_add_hash_column(spark, config, arrow_uploader)    
         else:
             logger.error(f"Unknown mode: {config.mode}")
     except Exception as e:
@@ -204,7 +206,7 @@ def do_query(spark, config, arrow_uploader):
     
     logger.info(f"DataFrame successfully uploaded to MinIO as {object_name}, row count: {result.count()}.")
     # 通知服务端
-    notify_server_of_completion(config)
+    notify_server_of_completion(config, get_job_result(config, "success"))
 
 
 def do_write(spark, config, arrow_uploader):
@@ -282,7 +284,7 @@ def do_sort(spark, config, arrow_uploader):
         raise Exception("Failed to save sorted result to MinIO")
     
     logger.info(f"Sorted data successfully uploaded to MinIO as {object_name}")
-    notify_server_of_completion(config)
+    notify_server_of_completion(config, get_job_result(config, "success"))
 
 
 def do_count(spark, config, arrow_uploader):
@@ -311,7 +313,7 @@ def do_count(spark, config, arrow_uploader):
         raise Exception("Failed to save count result to MinIO")
     
     logger.info(f"Count result uploaded to MinIO as {object_name}")
-    notify_server_of_completion(config)
+    notify_server_of_completion(config, get_job_result(config, "success"))
 
 
 def do_groupby_count(spark, config, arrow_uploader):
@@ -338,7 +340,7 @@ def do_groupby_count(spark, config, arrow_uploader):
         raise Exception("Failed to save groupby count result to MinIO")
     
     logger.info(f"Group by count result uploaded to MinIO as {object_name}")
-    notify_server_of_completion(config)
+    notify_server_of_completion(config, get_job_result(config, "success"))
 
 def do_join(spark, config, arrow_uploader):
     """Execute join operation between database table and MinIO file"""
@@ -409,30 +411,141 @@ def do_join(spark, config, arrow_uploader):
         if target_table is None:
             raise Exception("Failed to save join result to database")
         
-        notify_server_of_completion(config)
+        notify_server_of_completion(config, get_job_result(config, "success"))
         
     except Exception as e:
         logger.error(f"Error in join operation: {str(e)}")
-        notify_server_of_completion(config, error=str(e))
+        notify_server_of_completion(config, get_job_result(config, "error", str(e)))
         raise
+    
+def do_add_hash_column(spark, config, arrow_uploader):
+    """Execute add hash column operation"""
+    try:
+        if not config.db_table:
+            raise ValueError("db_table parameter is required for add_hash_column mode")
+        if not config.join_columns:
+            raise ValueError("join_columns parameter is required for add_hash_column mode")
+        if not config.dbType:
+            raise ValueError("dbType parameter is required for add_hash_column mode")
+        if not config.embedded_table:
+            raise ValueError("embedded_table parameter is required for add_hash_column mode")
+        
+        # 从数据资产中加载数据到内存
+        db_strategy = DatabaseFactory.get_strategy(
+            config.dbType, 
+            config.host, 
+            config.port, 
+            config.dbName, 
+            config.username, 
+            config.password
+        )
+        
+        # 构建连接参数
+        jdbc_properties = {
+            "user": config.username,
+            "password": config.password,
+            "driver": db_strategy.get_driver()
+        }
+        
+        # 设置分区数，如果未指定则默认为10
+        num_partitions = config.partitions if config.partitions else 10
+        
+        # 取第一个join列作为分区键
+        join_column = config.join_columns[0]
+        
+        # 创建谓词分区
+        predicates = []
+        for i in range(num_partitions):
+            if i == num_partitions - 1:
+                predicates.append(f"MOD(ABS(CRC32({join_column})), {num_partitions}) >= {i}")
+            else:
+                predicates.append(f"MOD(ABS(CRC32({join_column})), {num_partitions}) = {i}")
+        
+        logger.info(f"Using predicates for partitioned reading: {predicates}")
+        
+        # 读取数据库数据
+        db_df = spark.read.jdbc(
+            url=db_strategy.get_jdbc_url(),
+            table=config.db_table,
+            predicates=predicates,
+            properties=jdbc_properties
+        )
+        
+        # 缓存数据
+        db_df.cache()
+        db_df.count()  # 触发缓存
+        
+        # 添加hash列
+        from pyspark.sql.functions import sha2, concat_ws, col, substring
+        
+        result_df = db_df.withColumn(
+            "combined_join_column",
+            substring(
+                sha2(
+                    concat_ws("|", *[col(c) for c in config.join_columns]),
+                    256
+                ),
+                1, 32
+            )
+        )
+        
+        # 保存结果到数据库
+        table_name = save_dataframe_to_embedded_database(result_df, config)
+        if table_name is None:
+            raise Exception("Failed to save result to database")
+        
+        # 保存hash列到csv文件
+        object_name = arrow_uploader.save_hash_column_to_csv(result_df, "combined_join_column", config.bucket)
+        if object_name is None:
+            raise Exception("Failed to save hash column to csv file")
+            
+        notify_server_of_completion(config, get_job_result(config, "success", data={
+            "bucket": config.bucket,
+            "object": object_name
+        }))
+        
+    except Exception as e:
+        logger.error(f"Error in add_hash_column operation: {str(e)}")
+        notify_server_of_completion(config, get_job_result(config, "error", str(e)))
+        raise
+    finally:
+        # 释放缓存
+        if 'db_df' in locals():
+            db_df.unpersist()
 
-def notify_server_of_completion(config, error=None):
+def get_job_result(config, status="success", error=None, data=None):
+    """
+    统一的作业结果返回格式
+    
+    Args:
+        config: 配置对象
+        status: 状态 ("success" 或 "error")
+        error: 错误信息（如果有）
+        data: 包含所有其他数据的字典（如dbName, tableName, objectName等）
+    
+    Returns:
+        dict: 统一格式的结果
+    """
+    result = {
+        "status": status,
+        "mode": config.mode
+    }
+    
+    if error:
+        result["error"] = error
+    
+    if data:
+        result.update(data)
+        
+    return result            
+
+def notify_server_of_completion(config, result):
     server_endpoint = f"{config.serverip}:{config.serverport}"
     url = urljoin(f"http://{server_endpoint}", "/api/job/completed")
-    payload = {
-        "dbName": config.embedded_dbName,
-        "tableName": config.embedded_table,
-    }
-    # 如果有错误信息，添加到payload中
-    if error:
-        payload["error"] = error
-        payload["status"] = "error"
-    else:
-        payload["status"] = "success"
-    logger.info(f"Partition URLs and total rows to notify server: {payload}")
+    logger.info(f"Notifying server with result: {result}")
 
     try:
-        response = requests.post(url, json=payload, headers={'Content-Type': 'application/json'})
+        response = requests.post(url, json=result, headers={'Content-Type': 'application/json'})
         logger.info(f"Server notification response: {response.text}")
     except Exception as e:
         logger.error(f"Failed to notify server: {e}")

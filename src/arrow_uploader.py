@@ -159,3 +159,46 @@ class ArrowUploader:
         logger.info(f"Finished processing Arrow file and returning DataFrame.")
 
         return result_df
+
+    def save_hash_column_to_csv(self, spark_df, column_name, object_name=None):
+        """
+        将DataFrame中的指定列保存为CSV文件到MinIO
+        
+        Args:
+            spark_df: Spark DataFrame
+            column_name: 要保存的列名
+            object_name: 保存的文件名，如果不指定则自动生成
+            
+        Returns:
+            str: 保存的文件名
+        """
+        import uuid
+        import io
+        
+        # 如果没有指定文件名，生成一个
+        if object_name is None:
+            object_name = f"data/hash_values_{uuid.uuid4().hex}.csv"
+        
+        # 只选择指定的列
+        hash_df = spark_df.select(column_name)
+        
+        # 将DataFrame转换为CSV格式的字符串
+        csv_data = hash_df.rdd.map(lambda row: str(row[0])).collect()
+        csv_content = '\n'.join(csv_data)
+        
+        # 创建字节流对象
+        byte_stream = io.BytesIO(csv_content.encode('utf-8'))
+        
+        # 上传到MinIO
+        self.minio_client.put_object(
+            bucket_name=self.bucket_name,
+            object_name=object_name,
+            data=byte_stream,
+            length=len(csv_content.encode('utf-8')),
+            content_type='text/csv'
+        )
+        
+        logger.info(f"Hash values saved to MinIO as {object_name}")
+        return object_name
+    
+    
