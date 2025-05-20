@@ -27,6 +27,7 @@ class Config:
         self.endpoint = kwargs.get('endpoint', '')
         self.incolumns = kwargs.get('incolumns', []) # Fields for where xxx in clause
         self.columns = kwargs.get('columns', []) # Fields to select
+        self.orderby_column = kwargs.get('orderby_column', '')
         self.serverip = kwargs.get('serverip', '') # Data component address
         self.serverport = kwargs.get('serverport', 0)
         # New database related parameters
@@ -62,8 +63,8 @@ def parse_args():
 
     # Add mode parameter
     parser.add_argument("--mode", type=str, required=True, 
-                       choices=["query", "write", "sort", "count", "groupby_count", "join", "add_hash_column"], 
-                       help="Operation mode: query, write, sort, count, groupby_count, join, or add_hash_column")
+                       choices=["query", "write", "sort", "count", "groupby_count", "join", "add_hash_column", "psi_join"], 
+                       help="Operation mode: query, write, sort, count, groupby_count, join, add_hash_column, or psi_join")
 
     parser.add_argument("--accesskey", type=str, help="OSS access key")
     parser.add_argument("--secretkey", type=str, help="OSS secret key")
@@ -74,6 +75,7 @@ def parse_args():
     parser.add_argument("--incolumns", type=str, help="List of columns for IN clause (comma-separated)")
     parser.add_argument("--endpoint", type=str, required=True, help="Endpoint in OSS")
     parser.add_argument("--columns", type=str, help="List of columns to SELECT (comma-separated)")
+    parser.add_argument("--orderby_column", type=str, help="Order by column")
     parser.add_argument("--serverip", type=str, help="Data server IP")
     parser.add_argument("--serverport", type=int, help="Data server port")
     # New database related parameters
@@ -141,12 +143,16 @@ def run_spark_job(config):
             do_sort(spark, config, arrow_uploader)
         elif config.mode == "join":
             do_join(spark, config, arrow_uploader)
+        elif config.mode == "psi_join":
+            do_psi_join(spark, config, arrow_uploader)
         elif config.mode == "count":
             do_count(spark, config, arrow_uploader)
         elif config.mode == "groupby_count":
             do_groupby_count(spark, config, arrow_uploader)
         elif config.mode == "add_hash_column":
-            do_add_hash_column(spark, config, arrow_uploader)    
+            do_add_hash_column(spark, config, arrow_uploader)
+        elif config.mode == "psi_join":
+            do_psi_join(spark, config, arrow_uploader)
         else:
             logger.error(f"Unknown mode: {config.mode}")
     except Exception as e:
@@ -417,6 +423,81 @@ def do_join(spark, config, arrow_uploader):
         logger.error(f"Error in join operation: {str(e)}")
         notify_server_of_completion(config, get_job_result(config, "error", str(e)))
         raise
+
+def do_psi_join(spark, config, arrow_uploader):
+    """Execute psi join operation"""
+    try:
+        if not config.dataobject:
+            raise ValueError("dataobject parameter is required for join mode")
+        if not config.join_columns:
+            raise ValueError("join_columns parameter is required for join mode")
+        
+        # 从中间表中取数据
+        db_strategy = DatabaseFactory.get_strategy(
+            config.embedded_dbType, 
+            config.embedded_host, 
+            config.embedded_port, 
+            config.embedded_dbName, 
+            config.embedded_username, 
+            config.embedded_password
+        )
+        
+        # 构建连接参数
+        jdbc_properties = {
+            "user": config.embedded_username,
+            "password": config.embedded_password,
+            "driver": db_strategy.get_driver()
+        }
+        
+        # 设置分区数，如果未指定则默认为10
+        num_partitions = config.partitions if config.partitions else 10
+        
+        # 取第一个join列作为分区键
+        join_column = config.join_columns[0]
+        
+        # 创建谓词分区 - 组合使用MOD和CRC32
+        predicates = []
+        for i in range(num_partitions):
+            # 对于最后一个分区，使用 >= 确保不漏数据
+            if i == num_partitions - 1:
+                predicates.append(f"MOD(ABS(CRC32({join_column})), {num_partitions}) >= {i}")
+            else:
+                predicates.append(f"MOD(ABS(CRC32({join_column})), {num_partitions}) = {i}")
+        
+        # 使用日志记录谓词
+        logger.info(f"Using predicates for partitioned reading: {predicates}")
+        
+        # 使用谓词分区读取数据库
+        db_df = spark.read.jdbc(
+            url=db_strategy.get_jdbc_url(),
+            table=config.embedded_table,
+            predicates=predicates,
+            properties=jdbc_properties
+        )
+        
+        # 读取MinIO文件
+        minio_df = read_dataframe_from_minio(arrow_uploader, spark, config.bucket, config.dataobject)
+        
+        # 执行join操作
+        if len(config.join_columns) == 1:
+            result_df = db_df.join(minio_df, on=config.join_columns[0], how=config.join_type)
+        else:
+            result_df = db_df.join(minio_df, on=config.join_columns, how=config.join_type)
+
+        # 按照orderby_column进行升序排序
+        result_df = result_df.sort(config.orderby_column)    
+        
+        # 保存结果到中间数据库
+        target_table = save_dataframe_to_embedded_database(result_df, config)
+        if target_table is None:
+            raise Exception("Failed to save join result to database")
+        
+        notify_server_of_completion(config, get_job_result(config, "success"))
+        
+    except Exception as e:
+        logger.error(f"Error in join operation: {str(e)}")
+        notify_server_of_completion(config, get_job_result(config, "error", str(e)))
+        raise
     
 def do_add_hash_column(spark, config, arrow_uploader):
     """Execute add hash column operation"""
@@ -495,7 +576,7 @@ def do_add_hash_column(spark, config, arrow_uploader):
             raise Exception("Failed to save result to database")
         
         # 保存hash列到csv文件
-        object_name = arrow_uploader.save_hash_column_to_csv(result_df, "combined_join_column", config.bucket)
+        object_name = arrow_uploader.save_hash_column_to_csv(result_df, "combined_join_column")
         if object_name is None:
             raise Exception("Failed to save hash column to csv file")
             
