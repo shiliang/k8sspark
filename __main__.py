@@ -1,6 +1,8 @@
 import argparse
 import logging
 import uuid
+import redis
+import json
 
 import requests
 import pyarrow as pa
@@ -56,6 +58,15 @@ class Config:
         self.join_columns = kwargs.get('join_columns', [])
         self.db_table = kwargs.get('db_table', '')
         self.partitions = kwargs.get('partitions', None)
+        # Redis相关参数
+        self.redis_host = kwargs.get('redis_host', 'localhost')
+        self.redis_port = kwargs.get('redis_port', 6379)
+        self.redis_password = kwargs.get('redis_password', '')
+        self.redis_db = kwargs.get('redis_db', 0)
+        # Pod名称参数
+        self.podName = kwargs.get('podName', '')
+        # 目标表
+        self.target_table = kwargs.get('target_table', '')
 
 
 def parse_args():
@@ -103,6 +114,15 @@ def parse_args():
     parser.add_argument("--db_table", type=str, help="Database table name for join")
     parser.add_argument("--partitions", type=int,
                         help="Number of partitions to use (optional, will calculate if not provided)")
+    # Redis相关参数
+    parser.add_argument("--redis_host", type=str, default="localhost", help="Redis host")
+    parser.add_argument("--redis_port", type=int, default=6379, help="Redis port")
+    parser.add_argument("--redis_password", type=str, default="", help="Redis password")
+    parser.add_argument("--redis_db", type=int, default=0, help="Redis database number")
+    # Pod名称参数
+    parser.add_argument("--podName", type=str, required=True, help="Pod name for Redis key")
+    # 目标表
+    parser.add_argument("--target_table", type=str, help="Target table name")
 
     args = parser.parse_args()
     
@@ -151,8 +171,6 @@ def run_spark_job(config):
             do_groupby_count(spark, config, arrow_uploader)
         elif config.mode == "add_hash_column":
             do_add_hash_column(spark, config, arrow_uploader)
-        elif config.mode == "psi_join":
-            do_psi_join(spark, config, arrow_uploader)
         else:
             logger.error(f"Unknown mode: {config.mode}")
     except Exception as e:
@@ -428,9 +446,11 @@ def do_psi_join(spark, config, arrow_uploader):
     """Execute psi join operation"""
     try:
         if not config.dataobject:
-            raise ValueError("dataobject parameter is required for join mode")
+            raise ValueError("dataobject parameter is required for psi join mode")
         if not config.join_columns:
-            raise ValueError("join_columns parameter is required for join mode")
+            raise ValueError("join_columns parameter is required for psi join mode")
+        if not config.orderby_column:
+            raise ValueError("orderby_column parameter is required for psi join mode")
         
         # 从中间表中取数据
         db_strategy = DatabaseFactory.get_strategy(
@@ -485,18 +505,22 @@ def do_psi_join(spark, config, arrow_uploader):
             result_df = db_df.join(minio_df, on=config.join_columns, how=config.join_type)
 
         # 按照orderby_column进行升序排序
-        result_df = result_df.sort(config.orderby_column)    
+        result_df = result_df.sort(config.orderby_column)
+
+        logger.info(f"Total number of rows: {result_df.count()}")
+        first_row = result_df.first()
+        logger.info(f"First row data: {first_row}")    
         
         # 保存结果到中间数据库
-        target_table = save_dataframe_to_embedded_database(result_df, config)
+        target_table = save_dataframe_to_target_table(result_df, config)
         if target_table is None:
             raise Exception("Failed to save join result to database")
         
-        notify_server_of_completion(config, get_job_result(config, "success"))
+        save_result_to_redis(config, get_job_result(config, "success"))
         
     except Exception as e:
         logger.error(f"Error in join operation: {str(e)}")
-        notify_server_of_completion(config, get_job_result(config, "error", str(e)))
+        save_result_to_redis(config, get_job_result(config, "error", str(e)))
         raise
     
 def do_add_hash_column(spark, config, arrow_uploader):
@@ -580,14 +604,19 @@ def do_add_hash_column(spark, config, arrow_uploader):
         if object_name is None:
             raise Exception("Failed to save hash column to csv file")
             
-        notify_server_of_completion(config, get_job_result(config, "success", data={
+        # 生成作业结果
+        result = get_job_result(config, "success", data={
             "bucket": config.bucket,
             "object": object_name
-        }))
+        })
+
+        # 保存到Redis
+        save_result_to_redis(config, result)
         
     except Exception as e:
         logger.error(f"Error in add_hash_column operation: {str(e)}")
-        notify_server_of_completion(config, get_job_result(config, "error", str(e)))
+        result = get_job_result(config, "error", str(e))
+        save_result_to_redis(config, result)
         raise
     finally:
         # 释放缓存
@@ -630,6 +659,41 @@ def notify_server_of_completion(config, result):
         logger.info(f"Server notification response: {response.text}")
     except Exception as e:
         logger.error(f"Failed to notify server: {e}")
+
+def save_result_to_redis(config, result):
+    """
+    将作业结果保存到Redis
+    
+    Args:
+        config: 配置对象
+        result: 作业结果
+    """
+    
+    try:
+        # 连接Redis
+        redis_client = redis.Redis(
+            host=config.redis_host, 
+            port=config.redis_port,
+            password=config.redis_password,
+            db=config.redis_db
+        )
+        
+        # 使用podName作为key
+        key = f"job_result:{config.podName}"
+        
+        # 将结果转为JSON字符串
+        result_json = json.dumps(result)
+        
+        # 保存到Redis，设置过期时间为1天
+        redis_client.setex(key, 86400, result_json)
+        
+        # 记录Redis信息
+        logger.info(f"Result saved to Redis with key: {key}")
+        
+        return True
+    except Exception as e:
+        logger.error(f"Failed to save result to Redis: {e}")
+        return False         
 
 
 def save_dataframe_to_minio_distributed(result, config):
@@ -758,6 +822,66 @@ def save_dataframe_to_embedded_database(result, config):
         import traceback
         logger.error(traceback.format_exc())
         return None
+    
+def save_dataframe_to_target_table(result, config):
+    # 参数校验
+    if not config.embedded_dbType:
+        raise ValueError("embedded_dbType 参数不能为空")
+    if not config.embedded_dbName:
+        raise ValueError("embedded_dbName 参数不能为空")
+
+    # 表名
+    target_table = config.target_table
+    if not target_table:
+        import uuid
+        target_table = f"result_{uuid.uuid4().hex[:8]}"
+        logger.info(f"未指定表名，自动生成表名: {target_table}")
+
+    # 获取数据库驱动和URL
+    db_strategy = DatabaseFactory.get_strategy(
+        config.embedded_dbType, 
+        config.embedded_host, 
+        config.embedded_port, 
+        config.embedded_dbName, 
+        config.embedded_username, 
+        config.embedded_password
+    )
+    jdbc_url = db_strategy.get_jdbc_url()
+
+    # 构建连接参数
+    jdbc_properties = {
+        "driver": db_strategy.get_driver()
+    }
+    if config.embedded_username:
+        jdbc_properties["user"] = config.embedded_username
+    if config.embedded_password:
+        jdbc_properties["password"] = config.embedded_password
+
+    # 写入模式
+    write_mode = "overwrite"  # 也可以根据需要改为"append"
+
+    try:
+        logger.info(f"写入DataFrame到内置数据库表: {target_table}")
+        logger.info(f"JDBC URL: {jdbc_url}")
+        logger.info(f"JDBC属性: {jdbc_properties}")
+
+        result.write \
+            .format("jdbc") \
+            .option("url", jdbc_url) \
+            .option("dbtable", target_table) \
+            .mode(write_mode) \
+            .options(**jdbc_properties) \
+            .save()
+
+        row_count = result.count()
+        logger.info(f"成功写入 {row_count} 行到表 {target_table}")
+        return target_table
+    except Exception as e:
+        logger.error(f"写入内置数据库失败: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return None
+
 
 def read_dataframe_from_minio(arrow_uploader, spark, bucket, object):
     return arrow_uploader.read_from_minio(spark, bucket, object)
