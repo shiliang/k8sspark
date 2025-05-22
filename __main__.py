@@ -3,6 +3,7 @@ import logging
 import uuid
 import redis
 import json
+import time
 
 import requests
 import pyarrow as pa
@@ -595,15 +596,28 @@ def do_add_hash_column(spark, config, arrow_uploader):
         )
         
         # 保存结果到数据库
+        total_start_time = time.time()
+        db_start_time = time.time()
         table_name = save_dataframe_to_embedded_database(result_df, config)
+        db_time = time.time() - db_start_time
+        logger.info(f"保存到数据库耗时: {db_time:.2f}秒, 表名: {table_name}")
+
         if table_name is None:
             raise Exception("Failed to save result to database")
-        
+
         # 保存hash列到csv文件
+        csv_start_time = time.time()
         object_name = arrow_uploader.save_hash_column_to_csv(result_df, "combined_join_column")
+        csv_time = time.time() - csv_start_time
+        logger.info(f"保存hash列耗时: {csv_time:.2f}秒, CSV文件名: {object_name}")
+
         if object_name is None:
             raise Exception("Failed to save hash column to csv file")
-            
+
+        # 总耗时统计
+        total_time = time.time() - total_start_time
+        logger.info(f"总保存耗时: {total_time:.2f}秒")
+
         # 生成作业结果
         result = get_job_result(config, "success", data={
             "bucket": config.bucket,
@@ -857,27 +871,49 @@ def save_dataframe_to_target_table(result, config):
     if config.embedded_password:
         jdbc_properties["password"] = config.embedded_password
 
-    # 写入模式
-    write_mode = "overwrite"  # 也可以根据需要改为"append"
-
     try:
-        logger.info(f"写入DataFrame到内置数据库表: {target_table}")
-        logger.info(f"JDBC URL: {jdbc_url}")
-        logger.info(f"JDBC属性: {jdbc_properties}")
-
+        # 1. 直接写入目标表，但先不设置主键
         result.write \
             .format("jdbc") \
             .option("url", jdbc_url) \
             .option("dbtable", target_table) \
-            .mode(write_mode) \
+            .mode("overwrite") \
             .options(**jdbc_properties) \
             .save()
-
-        row_count = result.count()
-        logger.info(f"成功写入 {row_count} 行到表 {target_table}")
-        return target_table
+            
+        # 2. 使用JDBC执行ALTER TABLE
+        import mysql.connector
+        
+        # 创建MySQL连接
+        conn = mysql.connector.connect(
+            host=config.embedded_host,
+            port=config.embedded_port,
+            user=config.embedded_username,
+            password=config.embedded_password,
+            database=config.embedded_dbName
+        )
+        
+        cursor = conn.cursor()
+        
+        try:
+            # 添加主键约束
+            alter_table_sql = f"""
+            ALTER TABLE {target_table} 
+            ADD PRIMARY KEY ({config.orderby_column})
+            """
+            
+            cursor.execute(alter_table_sql)
+            conn.commit()
+            
+            logger.info(f"成功创建表 {target_table} 并将 {config.orderby_column} 设置为主键")
+            return target_table
+            
+        finally:
+            cursor.close()
+            conn.close()
+        
     except Exception as e:
-        logger.error(f"写入内置数据库失败: {e}")
+        logger.error(f"写入数据库失败: {e}")
         import traceback
         logger.error(traceback.format_exc())
         return None

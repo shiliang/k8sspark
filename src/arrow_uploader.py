@@ -6,6 +6,7 @@ from minio import Minio, S3Error
 import pyarrow.ipc as ipc
 import io
 import pyarrow as pa
+import uuid
 
 # 初始化日志
 logging.basicConfig(level=logging.INFO)
@@ -200,5 +201,32 @@ class ArrowUploader:
         
         logger.info(f"Hash values saved to MinIO as {object_name}")
         return object_name
+
+def save_dataframe_to_minio_single(result, config):
+    """将DataFrame保存为单个Arrow文件到MinIO"""
+    # 生成唯一标识
+    unique_id = uuid.uuid4().hex
+    data_directory = "data/"  # 指定存储目录
+    file_name = f"{data_directory}result_{unique_id}.arrow"
+    
+    # 创建ArrowUploader实例
+    arrow_uploader = ArrowUploader(
+        config.endpoint, 
+        config.accesskey, 
+        config.secretkey, 
+        config.bucket
+    )
+    
+    # 将DataFrame转换为Pandas DataFrame
+    pdf = result.toPandas()
+    
+    # 转换为Arrow表
+    table = pa.Table.from_pandas(pdf)
+    
+    # 保存到MinIO
+    arrow_uploader.save_to_minio(table, file_name)
+    
+    logger.info(f"DataFrame successfully saved to MinIO as {file_name}")
+    return file_name
     
     
