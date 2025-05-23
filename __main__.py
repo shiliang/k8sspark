@@ -443,6 +443,87 @@ def do_join(spark, config, arrow_uploader):
         notify_server_of_completion(config, get_job_result(config, "error", str(e)))
         raise
 
+# def do_psi_join(spark, config, arrow_uploader):
+#     """Execute psi join operation"""
+#     try:
+#         if not config.dataobject:
+#             raise ValueError("dataobject parameter is required for psi join mode")
+#         if not config.join_columns:
+#             raise ValueError("join_columns parameter is required for psi join mode")
+#         if not config.orderby_column:
+#             raise ValueError("orderby_column parameter is required for psi join mode")
+        
+#         # 从中间表中取数据
+#         db_strategy = DatabaseFactory.get_strategy(
+#             config.embedded_dbType, 
+#             config.embedded_host, 
+#             config.embedded_port, 
+#             config.embedded_dbName, 
+#             config.embedded_username, 
+#             config.embedded_password
+#         )
+        
+#         # 构建连接参数
+#         jdbc_properties = {
+#             "user": config.embedded_username,
+#             "password": config.embedded_password,
+#             "driver": db_strategy.get_driver()
+#         }
+        
+#         # 设置分区数，如果未指定则默认为10
+#         num_partitions = config.partitions if config.partitions else 10
+        
+#         # 取第一个join列作为分区键
+#         join_column = config.join_columns[0]
+        
+#         # 创建谓词分区 - 组合使用MOD和CRC32
+#         predicates = []
+#         for i in range(num_partitions):
+#             # 对于最后一个分区，使用 >= 确保不漏数据
+#             if i == num_partitions - 1:
+#                 predicates.append(f"MOD(ABS(CRC32({join_column})), {num_partitions}) >= {i}")
+#             else:
+#                 predicates.append(f"MOD(ABS(CRC32({join_column})), {num_partitions}) = {i}")
+        
+#         # 使用日志记录谓词
+#         logger.info(f"Using predicates for partitioned reading: {predicates}")
+
+#         # 使用谓词分区读取数据库
+#         db_df = spark.read.jdbc(
+#             url=db_strategy.get_jdbc_url(),
+#             table=config.embedded_table,
+#             predicates=predicates,
+#             properties=jdbc_properties
+#         )
+        
+#         # 读取MinIO文件
+#         minio_df = read_dataframe_from_minio(arrow_uploader, spark, config.bucket, config.dataobject)
+        
+#         # 执行join操作
+#         if len(config.join_columns) == 1:
+#             result_df = db_df.join(minio_df, on=config.join_columns[0], how=config.join_type)
+#         else:
+#             result_df = db_df.join(minio_df, on=config.join_columns, how=config.join_type)
+
+#         # 按照orderby_column进行升序排序
+#         result_df = result_df.sort(config.orderby_column)
+
+#         logger.info(f"Total number of rows: {result_df.count()}")
+#         first_row = result_df.first()
+#         logger.info(f"First row data: {first_row}")    
+        
+#         # 保存结果到中间数据库
+#         target_table = save_dataframe_to_target_table(result_df, config)
+#         if target_table is None:
+#             raise Exception("Failed to save join result to database")
+        
+#         save_result_to_redis(config, get_job_result(config, "success"))
+        
+#     except Exception as e:
+#         logger.error(f"Error in join operation: {str(e)}")
+#         save_result_to_redis(config, get_job_result(config, "error", str(e)))
+#         raise
+
 def do_psi_join(spark, config, arrow_uploader):
     """Execute psi join operation"""
     try:
@@ -452,49 +533,46 @@ def do_psi_join(spark, config, arrow_uploader):
             raise ValueError("join_columns parameter is required for psi join mode")
         if not config.orderby_column:
             raise ValueError("orderby_column parameter is required for psi join mode")
-        
-        # 从中间表中取数据
-        db_strategy = DatabaseFactory.get_strategy(
-            config.embedded_dbType, 
-            config.embedded_host, 
-            config.embedded_port, 
-            config.embedded_dbName, 
-            config.embedded_username, 
-            config.embedded_password
-        )
-        
-        # 构建连接参数
-        jdbc_properties = {
-            "user": config.embedded_username,
-            "password": config.embedded_password,
-            "driver": db_strategy.get_driver()
-        }
+        if not config.inobjects:
+            raise ValueError("inobjects parameter is required for reading from MinIO")
         
         # 设置分区数，如果未指定则默认为10
         num_partitions = config.partitions if config.partitions else 10
         
-        # 取第一个join列作为分区键
-        join_column = config.join_columns[0]
+        # 从MinIO读取文件列表
+        logger.info(f"Reading files from MinIO: {config.inobjects}")
         
-        # 创建谓词分区 - 组合使用MOD和CRC32
-        predicates = []
-        for i in range(num_partitions):
-            # 对于最后一个分区，使用 >= 确保不漏数据
-            if i == num_partitions - 1:
-                predicates.append(f"MOD(ABS(CRC32({join_column})), {num_partitions}) >= {i}")
+        # 记录加载数据开始时间
+        load_start_time = time.time()
+        
+        # 读取所有文件并合并
+        db_df = None
+        for file_path in config.inobjects:
+            logger.info(f"Reading file: {file_path}")
+            
+            # 使用ArrowUploader读取文件
+            file_df = arrow_uploader.read_from_minio(
+                spark=spark,
+                bucket_name=config.bucket,
+                object_name=file_path
+            )
+            
+            # 合并DataFrame
+            if db_df is None:
+                db_df = file_df
             else:
-                predicates.append(f"MOD(ABS(CRC32({join_column})), {num_partitions}) = {i}")
+                db_df = db_df.union(file_df)
         
-        # 使用日志记录谓词
-        logger.info(f"Using predicates for partitioned reading: {predicates}")
+        # 重新分区
+        db_df = db_df.repartition(num_partitions)
+        logger.info(f"Total partitions after reading: {db_df.rdd.getNumPartitions()}")
         
-        # 使用谓词分区读取数据库
-        db_df = spark.read.jdbc(
-            url=db_strategy.get_jdbc_url(),
-            table=config.embedded_table,
-            predicates=predicates,
-            properties=jdbc_properties
-        )
+        # 记录加载数据结束时间
+        load_time = time.time() - load_start_time
+        logger.info(f"加载数据耗时: {load_time:.2f}秒")
+        
+        # 记录join开始时间
+        join_start_time = time.time()
         
         # 读取MinIO文件
         minio_df = read_dataframe_from_minio(arrow_uploader, spark, config.bucket, config.dataobject)
@@ -507,10 +585,10 @@ def do_psi_join(spark, config, arrow_uploader):
 
         # 按照orderby_column进行升序排序
         result_df = result_df.sort(config.orderby_column)
-
-        logger.info(f"Total number of rows: {result_df.count()}")
-        first_row = result_df.first()
-        logger.info(f"First row data: {first_row}")    
+        
+        # 记录join结束时间
+        join_time = time.time() - join_start_time
+        logger.info(f"Join操作耗时: {join_time:.2f}秒")   
         
         # 保存结果到中间数据库
         target_table = save_dataframe_to_target_table(result_df, config)
@@ -523,7 +601,7 @@ def do_psi_join(spark, config, arrow_uploader):
         logger.error(f"Error in join operation: {str(e)}")
         save_result_to_redis(config, get_job_result(config, "error", str(e)))
         raise
-    
+
 def do_add_hash_column(spark, config, arrow_uploader):
     """Execute add hash column operation"""
     try:
@@ -604,6 +682,12 @@ def do_add_hash_column(spark, config, arrow_uploader):
 
         if table_name is None:
             raise Exception("Failed to save result to database")
+        
+        # 保存结果到MinIO
+        minio_start_time = time.time()
+        file_list = save_dataframe_to_minio_distributed(result_df, config)
+        minio_time = time.time() - minio_start_time
+        logger.info(f"保存到MinIO耗时: {minio_time:.2f}秒, 文件数: {len(file_list)}")
 
         # 保存hash列到csv文件
         csv_start_time = time.time()
@@ -621,7 +705,8 @@ def do_add_hash_column(spark, config, arrow_uploader):
         # 生成作业结果
         result = get_job_result(config, "success", data={
             "bucket": config.bucket,
-            "object": object_name
+            "object": object_name,
+            "arrow_files": file_list  # 包含所有Arrow文件信息
         })
 
         # 保存到Redis
@@ -712,12 +797,22 @@ def save_result_to_redis(config, result):
 
 def save_dataframe_to_minio_distributed(result, config):
     """将DataFrame的每个分区保存为独立的Arrow文件到MinIO的data/目录下"""
+    # 检查分区数
+    current_partitions = result.rdd.getNumPartitions()
+    logger.info(f"保存到MinIO的DataFrame分区数: {current_partitions}")
+    
+    # 获取DataFrame的列名
+    column_names = result.columns
+    logger.info(f"DataFrame列名: {column_names}")
+    
+    # 从podName中提取request.RequestId
+    request_id = config.podName.replace("spark-job-", "")
+    data_directory = f"data/{request_id}/"
+    
     # 生成唯一标识前缀
     unique_id = uuid.uuid4().hex
-    data_directory = "data/"  # 指定存储目录
     result_prefix = f"{data_directory}result_{unique_id}_part"
     
-    # 定义分区处理函数 - 直接将每个分区保存为最终文件
     def process_and_save_partition(partition_id, iterator):
         import pandas as pd
         import pyarrow as pa
@@ -730,43 +825,54 @@ def save_dataframe_to_minio_distributed(result, config):
         
         # 处理分区数据
         rows = list(iterator)
-        if not rows:
-            return []
+        logger.info(f"分区 {partition_id} 包含 {len(rows)} 行数据")
         
-        pdf = pd.DataFrame(rows)
+        if not rows:
+            logger.info(f"分区 {partition_id} 为空")
+            return iter([])
+        
+        # 使用原始列名创建DataFrame
+        pdf = pd.DataFrame(rows, columns=column_names)
         if pdf.empty:
-            return []
+            logger.info(f"分区 {partition_id} 转换为DataFrame后为空")
+            return iter([])
             
+        # 验证列名
+        logger.info(f"分区 {partition_id} DataFrame列名: {pdf.columns.tolist()}")
+        
         # 转换为Arrow表
         table = pa.Table.from_pandas(pdf)
         
-        # 最终文件命名 (直接保存在data/目录)
+        # 验证Arrow表的schema
+        logger.info(f"分区 {partition_id} Arrow表schema: {table.schema}")
+        
+        # 最终文件命名
         file_name = f"{result_prefix}{partition_id}.arrow"
         
         # 使用save_to_minio直接保存最终文件
         part_uploader.save_to_minio(table, file_name)
+        logger.info(f"分区 {partition_id} 保存文件: {file_name}")
         
-        return [file_name]
+        return iter([file_name])
     
     # 分布式处理并直接保存最终文件
     file_names = result.rdd.mapPartitionsWithIndex(
         process_and_save_partition
     ).collect()
     
-    # 展平文件名列表
-    flat_files = [name for files in file_names for name in files]
+    # 过滤掉空值
+    valid_files = [f for f in file_names if f]
     
-    if not flat_files:
+    logger.info(f"有效文件数量: {len(valid_files)}")
+    
+    if not valid_files:
         logger.warning("No data was saved - result DataFrame may be empty")
         return None
     
     # 记录所有保存的文件名，便于追踪
-    logger.info(f"Saved {len(flat_files)} Arrow files with prefix {result_prefix}")
+    logger.info(f"Saved {len(valid_files)} Arrow files with prefix {result_prefix}")
     
-    # 返回第一个文件名，或者文件名前缀
-    first_file = flat_files[0] if flat_files else None
-    logger.info(f"Returning reference file: {first_file}")
-    return first_file
+    return valid_files
 
 def save_dataframe_to_embedded_database(result, config):
     """
