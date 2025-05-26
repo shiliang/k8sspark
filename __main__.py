@@ -68,6 +68,7 @@ class Config:
         self.podName = kwargs.get('podName', '')
         # 目标表
         self.target_table = kwargs.get('target_table', '')
+        self.storage_type = kwargs.get('storage_type', '')
 
 
 def parse_args():
@@ -124,6 +125,8 @@ def parse_args():
     parser.add_argument("--podName", type=str, required=True, help="Pod name for Redis key")
     # 目标表
     parser.add_argument("--target_table", type=str, help="Target table name")
+    # 存储类型
+    parser.add_argument("--storage_type", type=str, choices=["db", "minio"], default="db", help="Storage type (db or minio)")
 
     args = parser.parse_args()
     
@@ -165,7 +168,13 @@ def run_spark_job(config):
         elif config.mode == "join":
             do_join(spark, config, arrow_uploader)
         elif config.mode == "psi_join":
-            do_psi_join(spark, config, arrow_uploader)
+            # 根据存储类型选择不同的PSI join实现
+            if hasattr(config, 'storage_type') and config.storage_type == "minio":
+                logger.info("Using MinIO storage for PSI join results")
+                do_psi_join_minio(spark, config, arrow_uploader)
+            else:
+                logger.info("Using database storage for PSI join results")
+                do_psi_join_db(spark, config, arrow_uploader)
         elif config.mode == "count":
             do_count(spark, config, arrow_uploader)
         elif config.mode == "groupby_count":
@@ -528,10 +537,11 @@ def do_psi_join_db(spark, config, arrow_uploader):
         raise
 
 def do_psi_join_minio(spark, config, arrow_uploader):
-    """Execute psi join operation"""
+    """Execute psi join operation - optimized version"""
     try:
-        # 总体开始时间
         total_start_time = time.time()
+        
+        # 验证参数
         if not config.dataobject:
             raise ValueError("dataobject parameter is required for psi join mode")
         if not config.join_columns:
@@ -541,14 +551,11 @@ def do_psi_join_minio(spark, config, arrow_uploader):
         if not config.inobjects:
             raise ValueError("inobjects parameter is required for reading from MinIO")
         
-        # 设置分区数，如果未指定则默认为10
         num_partitions = config.partitions if config.partitions else 10
+        join_column = config.join_columns[0]
         
-        # 从MinIO读取文件列表
-        logger.info(f"Reading files from MinIO: {config.inobjects}")
-        
-        # 记录加载数据开始时间
         load_start_time = time.time()
+        logger.info(f"Reading {len(config.inobjects)} files from MinIO")
         
         # 读取所有文件并合并
         db_df = None
@@ -568,39 +575,52 @@ def do_psi_join_minio(spark, config, arrow_uploader):
             else:
                 db_df = db_df.union(file_df)
         
-        # 重新分区
-        db_df = db_df.repartition(num_partitions)
-        logger.info(f"Total partitions after reading: {db_df.rdd.getNumPartitions()}")
+        # 预分区并缓存
+        db_df = db_df.repartition(num_partitions, join_column)
+        db_df.cache()
         
-        # 记录加载数据结束时间
         load_time = time.time() - load_start_time
         logger.info(f"Data loading time: {load_time:.2f} seconds")
         
-        # 记录join开始时间
+        # 优化2: 读取第二个数据源并缓存
+        minio_df = read_dataframe_from_minio(arrow_uploader, spark, config.bucket, config.dataobject)
+        minio_df.cache()
+        
+        # 检查是否可以使用广播join
+        minio_count = minio_df.count()
+        
         join_start_time = time.time()
         
-        # 读取MinIO文件
-        minio_df = read_dataframe_from_minio(arrow_uploader, spark, config.bucket, config.dataobject)
-        
-        # 执行join操作
-        if len(config.join_columns) == 1:
-            result_df = db_df.join(minio_df, on=config.join_columns[0], how=config.join_type)
+        # 优化3: 智能选择join策略
+        if minio_count < 1000000:  # 小表使用广播join
+            from pyspark.sql.functions import broadcast
+            logger.info(f"Using broadcast join for small table ({minio_count} rows)")
+            result_df = db_df.join(broadcast(minio_df), on=join_column, how=config.join_type)
         else:
-            result_df = db_df.join(minio_df, on=config.join_columns, how=config.join_type)
-
-        # 按照orderby_column进行升序排序
+            # 大表时确保分区对齐
+            logger.info(f"Using partitioned join for large table ({minio_count} rows)")
+            minio_df = minio_df.repartition(num_partitions, join_column)
+            result_df = db_df.join(minio_df, on=join_column, how=config.join_type)
+        
+        # 排序
         result_df = result_df.sort(config.orderby_column)
         
-        # 记录join结束时间
         join_time = time.time() - join_start_time
         logger.info(f"Join operation time: {join_time:.2f} seconds")
         
-        # 保存结果到中间数据库
+        # 保存结果
+        save_start_time = time.time()
         target_table = save_dataframe_to_target_table(result_df, config)
         if target_table is None:
             raise Exception("Failed to save join result to database")
         
-        # 总耗时统计
+        save_time = time.time() - save_start_time
+        logger.info(f"Save operation time: {save_time:.2f} seconds")
+        
+        # 清理缓存
+        db_df.unpersist()
+        minio_df.unpersist()
+        
         total_time = time.time() - total_start_time
         logger.info(f"Total PSI join time: {total_time:.2f} seconds")
         
@@ -682,21 +702,28 @@ def do_add_hash_column(spark, config, arrow_uploader):
             )
         )
         
-        # 保存结果到数据库
         total_start_time = time.time()
-        db_start_time = time.time()
-        table_name = save_dataframe_to_embedded_database(result_df, config)
-        db_time = time.time() - db_start_time
-        logger.info(f"保存到数据库耗时: {db_time:.2f}秒, 表名: {table_name}")
 
-        if table_name is None:
-            raise Exception("Failed to save result to database")
-        
-        # 保存结果到MinIO
-        minio_start_time = time.time()
-        file_list = save_dataframe_to_minio_distributed(result_df, config)
-        minio_time = time.time() - minio_start_time
-        logger.info(f"保存到MinIO耗时: {minio_time:.2f}秒, 文件数: {len(file_list)}")
+        if config.storage_type == "db":
+            db_start_time = time.time()
+            table_name = save_dataframe_to_embedded_database(result_df, config)
+            db_time = time.time() - db_start_time
+            logger.info(f"保存到数据库耗时: {db_time:.2f}秒, 表名: {table_name}")
+
+            if table_name is None:
+                raise Exception("Failed to save result to database")
+
+        elif config.storage_type == "minio":
+            minio_start_time = time.time()
+            file_list = save_dataframe_to_minio_distributed(result_df, config)
+            minio_time = time.time() - minio_start_time
+            logger.info(f"保存到MinIO耗时: {minio_time:.2f}秒, 文件数: {len(file_list)}")
+
+            if not file_list:
+                raise Exception("Failed to save result to MinIO")
+
+        else:
+            raise Exception(f"Unknown storage_type: {config.storage_type}")
 
         # 保存hash列到csv文件
         csv_start_time = time.time()
