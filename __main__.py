@@ -443,90 +443,95 @@ def do_join(spark, config, arrow_uploader):
         notify_server_of_completion(config, get_job_result(config, "error", str(e)))
         raise
 
-# def do_psi_join(spark, config, arrow_uploader):
-#     """Execute psi join operation"""
-#     try:
-#         if not config.dataobject:
-#             raise ValueError("dataobject parameter is required for psi join mode")
-#         if not config.join_columns:
-#             raise ValueError("join_columns parameter is required for psi join mode")
-#         if not config.orderby_column:
-#             raise ValueError("orderby_column parameter is required for psi join mode")
-        
-#         # 从中间表中取数据
-#         db_strategy = DatabaseFactory.get_strategy(
-#             config.embedded_dbType, 
-#             config.embedded_host, 
-#             config.embedded_port, 
-#             config.embedded_dbName, 
-#             config.embedded_username, 
-#             config.embedded_password
-#         )
-        
-#         # 构建连接参数
-#         jdbc_properties = {
-#             "user": config.embedded_username,
-#             "password": config.embedded_password,
-#             "driver": db_strategy.get_driver()
-#         }
-        
-#         # 设置分区数，如果未指定则默认为10
-#         num_partitions = config.partitions if config.partitions else 10
-        
-#         # 取第一个join列作为分区键
-#         join_column = config.join_columns[0]
-        
-#         # 创建谓词分区 - 组合使用MOD和CRC32
-#         predicates = []
-#         for i in range(num_partitions):
-#             # 对于最后一个分区，使用 >= 确保不漏数据
-#             if i == num_partitions - 1:
-#                 predicates.append(f"MOD(ABS(CRC32({join_column})), {num_partitions}) >= {i}")
-#             else:
-#                 predicates.append(f"MOD(ABS(CRC32({join_column})), {num_partitions}) = {i}")
-        
-#         # 使用日志记录谓词
-#         logger.info(f"Using predicates for partitioned reading: {predicates}")
-
-#         # 使用谓词分区读取数据库
-#         db_df = spark.read.jdbc(
-#             url=db_strategy.get_jdbc_url(),
-#             table=config.embedded_table,
-#             predicates=predicates,
-#             properties=jdbc_properties
-#         )
-        
-#         # 读取MinIO文件
-#         minio_df = read_dataframe_from_minio(arrow_uploader, spark, config.bucket, config.dataobject)
-        
-#         # 执行join操作
-#         if len(config.join_columns) == 1:
-#             result_df = db_df.join(minio_df, on=config.join_columns[0], how=config.join_type)
-#         else:
-#             result_df = db_df.join(minio_df, on=config.join_columns, how=config.join_type)
-
-#         # 按照orderby_column进行升序排序
-#         result_df = result_df.sort(config.orderby_column)
-
-#         logger.info(f"Total number of rows: {result_df.count()}")
-#         first_row = result_df.first()
-#         logger.info(f"First row data: {first_row}")    
-        
-#         # 保存结果到中间数据库
-#         target_table = save_dataframe_to_target_table(result_df, config)
-#         if target_table is None:
-#             raise Exception("Failed to save join result to database")
-        
-#         save_result_to_redis(config, get_job_result(config, "success"))
-        
-#     except Exception as e:
-#         logger.error(f"Error in join operation: {str(e)}")
-#         save_result_to_redis(config, get_job_result(config, "error", str(e)))
-#         raise
-
-def do_psi_join(spark, config, arrow_uploader):
+def do_psi_join_db(spark, config, arrow_uploader):
     """Execute psi join operation"""
     try:
+         # 总体开始时间
+        total_start_time = time.time()
+
+        if not config.dataobject:
+            raise ValueError("dataobject parameter is required for psi join mode")
+        if not config.join_columns:
+            raise ValueError("join_columns parameter is required for psi join mode")
+        if not config.orderby_column:
+            raise ValueError("orderby_column parameter is required for psi join mode")
+        
+        # 从中间表中取数据
+        db_strategy = DatabaseFactory.get_strategy(
+            config.embedded_dbType, 
+            config.embedded_host, 
+            config.embedded_port, 
+            config.embedded_dbName, 
+            config.embedded_username, 
+            config.embedded_password
+        )
+        
+        # 构建连接参数
+        jdbc_properties = {
+            "user": config.embedded_username,
+            "password": config.embedded_password,
+            "driver": db_strategy.get_driver()
+        }
+        
+        # 设置分区数，如果未指定则默认为10
+        num_partitions = config.partitions if config.partitions else 10
+        
+        # 取第一个join列作为分区键
+        join_column = config.join_columns[0]
+        
+        # 创建谓词分区 - 组合使用MOD和CRC32
+        predicates = []
+        for i in range(num_partitions):
+            # 对于最后一个分区，使用 >= 确保不漏数据
+            if i == num_partitions - 1:
+                predicates.append(f"MOD(ABS(CRC32({join_column})), {num_partitions}) >= {i}")
+            else:
+                predicates.append(f"MOD(ABS(CRC32({join_column})), {num_partitions}) = {i}")
+        
+        # 使用日志记录谓词
+        logger.info(f"Using predicates for partitioned reading: {predicates}")
+
+        # 使用谓词分区读取数据库
+        db_df = spark.read.jdbc(
+            url=db_strategy.get_jdbc_url(),
+            table=config.embedded_table,
+            predicates=predicates,
+            properties=jdbc_properties
+        )
+        
+        # 读取MinIO文件
+        minio_df = read_dataframe_from_minio(arrow_uploader, spark, config.bucket, config.dataobject)
+        
+        # 执行join操作
+        if len(config.join_columns) == 1:
+            result_df = db_df.join(minio_df, on=config.join_columns[0], how=config.join_type)
+        else:
+            result_df = db_df.join(minio_df, on=config.join_columns, how=config.join_type)
+
+        # 按照orderby_column进行升序排序
+        result_df = result_df.sort(config.orderby_column) 
+        
+        # 保存结果到中间数据库
+        target_table = save_dataframe_to_target_table(result_df, config)
+        if target_table is None:
+            raise Exception("Failed to save join result to database")
+        
+        # 总耗时统计
+        total_time = time.time() - total_start_time
+        logger.info(f"Total PSI join time: {total_time:.2f} seconds")
+        
+        save_result_to_redis(config, get_job_result(config, "success"))
+        
+    except Exception as e:
+        logger.error(f"Error in join operation: {str(e)}")
+        save_result_to_redis(config, get_job_result(config, "error", str(e)))
+        raise
+
+def do_psi_join_minio(spark, config, arrow_uploader):
+    """Execute psi join operation"""
+    try:
+        # 总体开始时间
+        total_start_time = time.time()
         if not config.dataobject:
             raise ValueError("dataobject parameter is required for psi join mode")
         if not config.join_columns:
@@ -569,7 +574,7 @@ def do_psi_join(spark, config, arrow_uploader):
         
         # 记录加载数据结束时间
         load_time = time.time() - load_start_time
-        logger.info(f"加载数据耗时: {load_time:.2f}秒")
+        logger.info(f"Data loading time: {load_time:.2f} seconds")
         
         # 记录join开始时间
         join_start_time = time.time()
@@ -588,12 +593,16 @@ def do_psi_join(spark, config, arrow_uploader):
         
         # 记录join结束时间
         join_time = time.time() - join_start_time
-        logger.info(f"Join操作耗时: {join_time:.2f}秒")   
+        logger.info(f"Join operation time: {join_time:.2f} seconds")
         
         # 保存结果到中间数据库
         target_table = save_dataframe_to_target_table(result_df, config)
         if target_table is None:
             raise Exception("Failed to save join result to database")
+        
+        # 总耗时统计
+        total_time = time.time() - total_start_time
+        logger.info(f"Total PSI join time: {total_time:.2f} seconds")
         
         save_result_to_redis(config, get_job_result(config, "success"))
         
