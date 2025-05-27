@@ -500,13 +500,16 @@ def do_psi_join_db(spark, config, arrow_uploader):
         # 使用日志记录谓词
         logger.info(f"Using predicates for partitioned reading: {predicates}")
 
-        # 使用谓词分区读取数据库
-        db_df = spark.read.jdbc(
-            url=db_strategy.get_jdbc_url(),
-            table=config.embedded_table,
-            predicates=predicates,
-            properties=jdbc_properties
+        # 使用优化的批量读取方法
+        logger.info(f"Reading {len(config.inobjects)} Arrow files using optimized method")
+        db_df = arrow_uploader.read_arrow_files_as_partitions_optimized(
+            spark=spark,
+            config=config
         )
+        
+        # 预分区并缓存
+        db_df = db_df.repartition(num_partitions, join_column)
+        db_df.cache()
         
         # 读取MinIO文件
         minio_df = read_dataframe_from_minio(arrow_uploader, spark, config.bucket, config.dataobject)
@@ -554,31 +557,18 @@ def do_psi_join_minio(spark, config, arrow_uploader):
         num_partitions = config.partitions if config.partitions else 10
         join_column = config.join_columns[0]
         
+        # 使用优化的批量读取方法
         load_start_time = time.time()
-        logger.info(f"Reading {len(config.inobjects)} files from MinIO")
-        
-        # 读取所有文件并合并
-        db_df = None
-        for file_path in config.inobjects:
-            logger.info(f"Reading file: {file_path}")
-            
-            # 使用ArrowUploader读取文件
-            file_df = arrow_uploader.read_from_minio(
-                spark=spark,
-                bucket_name=config.bucket,
-                object_name=file_path
-            )
-            
-            # 合并DataFrame
-            if db_df is None:
-                db_df = file_df
-            else:
-                db_df = db_df.union(file_df)
+        logger.info(f"Reading {len(config.inobjects)} Arrow files using optimized method")
+        db_df = arrow_uploader.read_arrow_files_as_partitions_optimized(
+            spark=spark,
+            config=config
+        )
         
         # 预分区并缓存
-        db_df = db_df.repartition(num_partitions, join_column)
+        # db_df = db_df.repartition(num_partitions, join_column)
         db_df.cache()
-        
+
         load_time = time.time() - load_start_time
         logger.info(f"Data loading time: {load_time:.2f} seconds")
         

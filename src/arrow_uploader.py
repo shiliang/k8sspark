@@ -202,31 +202,83 @@ class ArrowUploader:
         logger.info(f"Hash values saved to MinIO as {object_name}")
         return object_name
 
-def save_dataframe_to_minio_single(result, config):
-    """将DataFrame保存为单个Arrow文件到MinIO"""
-    # 生成唯一标识
-    unique_id = uuid.uuid4().hex
-    data_directory = "data/"  # 指定存储目录
-    file_name = f"{data_directory}result_{unique_id}.arrow"
-    
-    # 创建ArrowUploader实例
-    arrow_uploader = ArrowUploader(
-        config.endpoint, 
-        config.accesskey, 
-        config.secretkey, 
-        config.bucket
-    )
-    
-    # 将DataFrame转换为Pandas DataFrame
-    pdf = result.toPandas()
-    
-    # 转换为Arrow表
-    table = pa.Table.from_pandas(pdf)
-    
-    # 保存到MinIO
-    arrow_uploader.save_to_minio(table, file_name)
-    
-    logger.info(f"DataFrame successfully saved to MinIO as {file_name}")
-    return file_name
-    
-    
+    def read_arrow_files_as_partitions_optimized(self, spark, config):
+        """优化版本：使用mapPartitions直接处理Arrow文件"""
+        try:
+            import pyarrow as pa
+            import pyarrow.ipc as ipc
+            import pandas as pd
+            import io
+            
+            file_paths = config.inobjects
+            logger.info(f"Reading {len(file_paths)} Arrow files using optimized partition method")
+            
+            # 创建一个包含文件路径的RDD，每个文件路径一个分区
+            file_rdd = spark.sparkContext.parallelize(file_paths, len(file_paths))
+            
+            # 提取MinIO连接参数，避免序列化self对象
+            endpoint = config.endpoint
+            access_key = config.accesskey
+            secret_key = config.secretkey
+            bucket = config.bucket
+            
+            def process_arrow_file_partition(iterator):
+                """处理单个分区中的Arrow文件"""
+                # 在executor中重新创建MinIO客户端
+                from minio import Minio
+                import pyarrow.ipc as ipc
+                import io
+                
+                minio_client = Minio(
+                    endpoint=endpoint,
+                    access_key=access_key,
+                    secret_key=secret_key,
+                    secure=False
+                )
+                
+                for file_path in iterator:
+                    try:
+                        # 从MinIO下载文件
+                        obj = minio_client.get_object(bucket, file_path)
+                        file_bytes = io.BytesIO(obj.read())
+                        
+                        # 读取Arrow文件
+                        with ipc.open_file(file_bytes) as reader:
+                            for i in range(reader.num_record_batches):
+                                batch = reader.get_batch(i)
+                                pandas_df = batch.to_pandas()
+                                
+                                # 逐行yield数据
+                                for _, row in pandas_df.iterrows():
+                                    yield tuple(row)
+                        
+                        logger.info(f"Processed Arrow file {file_path} in partition")
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing Arrow file {file_path}: {e}")
+                        continue
+            
+            # 获取schema（从第一个文件）使用self.minio_client
+            first_obj = self.minio_client.get_object(config.bucket, file_paths[0])
+            first_bytes = io.BytesIO(first_obj.read())
+            
+            with ipc.open_file(first_bytes) as reader:
+                first_batch = reader.get_batch(0)
+                first_df = first_batch.to_pandas()
+                spark_schema = spark.createDataFrame(first_df).schema
+            
+            logger.info(f"Inferred schema from first Arrow file: {spark_schema}")
+            
+            # 应用mapPartitions处理
+            processed_rdd = file_rdd.mapPartitions(process_arrow_file_partition)
+            
+            # 转换为DataFrame
+            result_df = spark.createDataFrame(processed_rdd, spark_schema)
+            
+            logger.info(f"Created DataFrame with {result_df.rdd.getNumPartitions()} partitions from Arrow files")
+            
+            return result_df
+            
+        except Exception as e:
+            logger.error(f"Error in optimized Arrow file reading: {e}")
+            raise
