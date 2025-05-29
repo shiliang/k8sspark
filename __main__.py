@@ -455,9 +455,6 @@ def do_join(spark, config, arrow_uploader):
 def do_psi_join_db(spark, config, arrow_uploader):
     """Execute psi join operation"""
     try:
-         # 总体开始时间
-        total_start_time = time.time()
-
         if not config.dataobject:
             raise ValueError("dataobject parameter is required for psi join mode")
         if not config.join_columns:
@@ -488,28 +485,30 @@ def do_psi_join_db(spark, config, arrow_uploader):
         # 取第一个join列作为分区键
         join_column = config.join_columns[0]
         
-        # 创建谓词分区 - 组合使用MOD和CRC32
+        # 创建谓词分区
         predicates = []
         for i in range(num_partitions):
-            # 对于最后一个分区，使用 >= 确保不漏数据
-            if i == num_partitions - 1:
-                predicates.append(f"MOD(ABS(CRC32({join_column})), {num_partitions}) >= {i}")
-            else:
-                predicates.append(f"MOD(ABS(CRC32({join_column})), {num_partitions}) = {i}")
+            if config.embedded_dbType == "1":  # MySQL
+                if i == num_partitions - 1:
+                    predicates.append(f"MOD(ABS(CRC32({join_column})), {num_partitions}) >= {i}")
+                else:
+                    predicates.append(f"MOD(ABS(CRC32({join_column})), {num_partitions}) = {i}")
+            else:  # KingBase
+                if i == num_partitions - 1:
+                    predicates.append(f"MOD(CAST(('x' || md5({join_column}))::bit(64) AS bigint), {num_partitions}) >= {i}")
+                else:
+                    predicates.append(f"MOD(CAST(('x' || md5({join_column}))::bit(64) AS bigint), {num_partitions}) = {i}")
         
         # 使用日志记录谓词
         logger.info(f"Using predicates for partitioned reading: {predicates}")
 
-        # 使用优化的批量读取方法
-        logger.info(f"Reading {len(config.inobjects)} Arrow files using optimized method")
-        db_df = arrow_uploader.read_arrow_files_as_partitions_optimized(
-            spark=spark,
-            config=config
+        # 使用谓词分区读取数据库
+        db_df = spark.read.jdbc(
+            url=db_strategy.get_jdbc_url(),
+            table=config.embedded_table,
+            predicates=predicates,
+            properties=jdbc_properties
         )
-        
-        # 预分区并缓存
-        db_df = db_df.repartition(num_partitions, join_column)
-        db_df.cache()
         
         # 读取MinIO文件
         minio_df = read_dataframe_from_minio(arrow_uploader, spark, config.bucket, config.dataobject)
@@ -521,16 +520,16 @@ def do_psi_join_db(spark, config, arrow_uploader):
             result_df = db_df.join(minio_df, on=config.join_columns, how=config.join_type)
 
         # 按照orderby_column进行升序排序
-        result_df = result_df.sort(config.orderby_column) 
+        result_df = result_df.sort(config.orderby_column)
+
+        logger.info(f"Total number of rows: {result_df.count()}")
+        first_row = result_df.first()
+        logger.info(f"First row data: {first_row}")    
         
         # 保存结果到中间数据库
         target_table = save_dataframe_to_target_table(result_df, config)
         if target_table is None:
             raise Exception("Failed to save join result to database")
-        
-        # 总耗时统计
-        total_time = time.time() - total_start_time
-        logger.info(f"Total PSI join time: {total_time:.2f} seconds")
         
         save_result_to_redis(config, get_job_result(config, "success"))
         
@@ -659,10 +658,16 @@ def do_add_hash_column(spark, config, arrow_uploader):
         # 创建谓词分区
         predicates = []
         for i in range(num_partitions):
-            if i == num_partitions - 1:
-                predicates.append(f"MOD(ABS(CRC32({join_column})), {num_partitions}) >= {i}")
-            else:
-                predicates.append(f"MOD(ABS(CRC32({join_column})), {num_partitions}) = {i}")
+            if config.embedded_dbType == "1":  # MySQL
+                if i == num_partitions - 1:
+                    predicates.append(f"MOD(ABS(CRC32({join_column})), {num_partitions}) >= {i}")
+                else:
+                    predicates.append(f"MOD(ABS(CRC32({join_column})), {num_partitions}) = {i}")
+            else:  # KingBase
+                if i == num_partitions - 1:
+                    predicates.append(f"MOD(CAST(('x' || md5({join_column}))::bit(64) AS bigint), {num_partitions}) >= {i}")
+                else:
+                    predicates.append(f"MOD(CAST(('x' || md5({join_column}))::bit(64) AS bigint), {num_partitions}) = {i}")
         
         logger.info(f"Using predicates for partitioned reading: {predicates}")
         
@@ -693,6 +698,7 @@ def do_add_hash_column(spark, config, arrow_uploader):
         )
         
         total_start_time = time.time()
+        file_list = []  # 初始化 file_list
 
         if config.storage_type == "db":
             db_start_time = time.time()
@@ -728,12 +734,19 @@ def do_add_hash_column(spark, config, arrow_uploader):
         total_time = time.time() - total_start_time
         logger.info(f"总保存耗时: {total_time:.2f}秒")
 
-        # 生成作业结果
-        result = get_job_result(config, "success", data={
+        # 生成作业结果 - 根据存储类型构建不同的数据
+        result_data = {
             "bucket": config.bucket,
-            "object": object_name,
-            "arrow_files": file_list  # 包含所有Arrow文件信息
-        })
+            "object": object_name
+        }
+        
+        # 只有当使用MinIO存储时才包含arrow_files
+        if config.storage_type == "minio" and file_list:
+            result_data["arrow_files"] = file_list
+        elif config.storage_type == "db":
+            result_data["table_name"] = table_name
+            
+        result = get_job_result(config, "success", data=result_data)
 
         # 保存到Redis
         save_result_to_redis(config, result)
@@ -1013,26 +1026,55 @@ def save_dataframe_to_target_table(result, config):
             .options(**jdbc_properties) \
             .save()
             
-        # 2. 使用JDBC执行ALTER TABLE
-        import mysql.connector
-        
-        # 创建MySQL连接
-        conn = mysql.connector.connect(
-            host=config.embedded_host,
-            port=config.embedded_port,
-            user=config.embedded_username,
-            password=config.embedded_password,
-            database=config.embedded_dbName
-        )
+        # 2. 根据数据库类型选择不同的连接方式
+        if config.embedded_dbType == "1":  # MySQL
+            import mysql.connector
+            conn = mysql.connector.connect(
+                host=config.embedded_host,
+                port=config.embedded_port,
+                user=config.embedded_username,
+                password=config.embedded_password,
+                database=config.embedded_dbName
+            )
+        else:  # KingBase
+            import psycopg2
+            conn = psycopg2.connect(
+                host=config.embedded_host,
+                port=config.embedded_port,
+                user=config.embedded_username,
+                password=config.embedded_password,
+                database=config.embedded_dbName
+            )
         
         cursor = conn.cursor()
         
         try:
-            # 添加主键约束
-            alter_table_sql = f"""
-            ALTER TABLE {target_table} 
-            ADD PRIMARY KEY ({config.orderby_column})
-            """
+            if config.embedded_dbType == "1":  # MySQL
+                # MySQL添加主键约束
+                alter_table_sql = f"""
+                ALTER TABLE {target_table} 
+                ADD PRIMARY KEY ({config.orderby_column})
+                """
+            else:  # KingBase
+                # KingBase添加主键约束和聚簇索引
+                alter_table_sql = f"""
+                DO $$
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1 FROM pg_constraint 
+                        WHERE conrelid = '{target_table}'::regclass 
+                        AND contype = 'p'
+                    ) THEN
+                        ALTER TABLE {target_table} DROP CONSTRAINT {target_table}_pkey;
+                    END IF;
+                END $$;
+                
+                ALTER TABLE {target_table} 
+                ADD CONSTRAINT {target_table}_pkey 
+                PRIMARY KEY ({config.orderby_column});
+                
+                CLUSTER {target_table} USING {target_table}_pkey;
+                """
             
             cursor.execute(alter_table_sql)
             conn.commit()
@@ -1040,6 +1082,11 @@ def save_dataframe_to_target_table(result, config):
             logger.info(f"成功创建表 {target_table} 并将 {config.orderby_column} 设置为主键")
             return target_table
             
+        except Exception as e:
+            logger.error(f"设置主键约束失败: {str(e)}")
+            # 如果设置主键失败，回滚事务
+            conn.rollback()
+            raise
         finally:
             cursor.close()
             conn.close()
