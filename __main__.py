@@ -489,15 +489,9 @@ def do_psi_join_db(spark, config, arrow_uploader):
         predicates = []
         for i in range(num_partitions):
             if config.embedded_dbType == "1":  # MySQL
-                if i == num_partitions - 1:
-                    predicates.append(f"MOD(ABS(CRC32({join_column})), {num_partitions}) >= {i}")
-                else:
-                    predicates.append(f"MOD(ABS(CRC32({join_column})), {num_partitions}) = {i}")
+                predicates.append(f"MOD(ABS(CRC32({join_column})), {num_partitions}) = {i}")
             else:  # KingBase
-                if i == num_partitions - 1:
-                    predicates.append(f"MOD(CAST(('x' || md5({join_column}))::bit(64) AS bigint), {num_partitions}) >= {i}")
-                else:
-                    predicates.append(f"MOD(CAST(('x' || md5({join_column}))::bit(64) AS bigint), {num_partitions}) = {i}")
+                predicates.append(f"MOD(ABS(hashtext({join_column}::text)), {num_partitions}) = {i}")
         
         # 使用日志记录谓词
         logger.info(f"Using predicates for partitioned reading: {predicates}")
@@ -520,11 +514,7 @@ def do_psi_join_db(spark, config, arrow_uploader):
             result_df = db_df.join(minio_df, on=config.join_columns, how=config.join_type)
 
         # 按照orderby_column进行升序排序
-        result_df = result_df.sort(config.orderby_column)
-
-        logger.info(f"Total number of rows: {result_df.count()}")
-        first_row = result_df.first()
-        logger.info(f"First row data: {first_row}")    
+        result_df = result_df.sort(config.orderby_column)  
         
         # 保存结果到中间数据库
         target_table = save_dataframe_to_target_table(result_df, config)
@@ -659,15 +649,9 @@ def do_add_hash_column(spark, config, arrow_uploader):
         predicates = []
         for i in range(num_partitions):
             if config.embedded_dbType == "1":  # MySQL
-                if i == num_partitions - 1:
-                    predicates.append(f"MOD(ABS(CRC32({join_column})), {num_partitions}) >= {i}")
-                else:
-                    predicates.append(f"MOD(ABS(CRC32({join_column})), {num_partitions}) = {i}")
+                predicates.append(f"MOD(ABS(CRC32({join_column})), {num_partitions}) = {i}")
             else:  # KingBase
-                if i == num_partitions - 1:
-                    predicates.append(f"MOD(CAST(('x' || md5({join_column}))::bit(64) AS bigint), {num_partitions}) >= {i}")
-                else:
-                    predicates.append(f"MOD(CAST(('x' || md5({join_column}))::bit(64) AS bigint), {num_partitions}) = {i}")
+                predicates.append(f"MOD(ABS(hashtext({join_column}::text)), {num_partitions}) = {i}")
         
         logger.info(f"Using predicates for partitioned reading: {predicates}")
         
@@ -702,7 +686,9 @@ def do_add_hash_column(spark, config, arrow_uploader):
 
         if config.storage_type == "db":
             db_start_time = time.time()
-            table_name = save_dataframe_to_embedded_database(result_df, config)
+            # 获取源表列类型
+            source_table_types = get_source_table_column_types(config)
+            table_name = save_dataframe_to_embedded_database(result_df, config, source_table_types)
             db_time = time.time() - db_start_time
             logger.info(f"保存到数据库耗时: {db_time:.2f}秒, 表名: {table_name}")
 
@@ -913,22 +899,22 @@ def save_dataframe_to_minio_distributed(result, config):
     
     return valid_files
 
-def save_dataframe_to_embedded_database(result, config):
+def save_dataframe_to_embedded_database(result, config, source_table_types):
     """
-    将Spark DataFrame保存到内置数据库（如SQLite、H2、Derby、HSQLDB）
-
+    将DataFrame保存到内置数据库
+    
     Args:
         result: Spark DataFrame
-        config: 配置对象，需包含embedded_dbType、embedded_dbName等参数
-
-    Returns:
-        str: 实际写入的表名
+        config: 配置对象
+        source_table_types: 源表的列类型映射字典，格式为 {column_name: data_type}
     """
     # 参数校验
     if not config.embedded_dbType:
         raise ValueError("embedded_dbType 参数不能为空")
     if not config.embedded_dbName:
         raise ValueError("embedded_dbName 参数不能为空")
+    if not source_table_types:
+        raise ValueError("source_table_types 参数不能为空")
 
     # 表名
     target_table = config.embedded_table
@@ -957,31 +943,28 @@ def save_dataframe_to_embedded_database(result, config):
     if config.embedded_password:
         jdbc_properties["password"] = config.embedded_password
 
-    # 写入模式
-    write_mode = "overwrite"  # 也可以根据需要改为"append"
-
     try:
-        logger.info(f"写入DataFrame到内置数据库表: {target_table}")
-        logger.info(f"JDBC URL: {jdbc_url}")
-        logger.info(f"JDBC属性: {jdbc_properties}")
+        # 构建createTableColumnTypes选项
+        create_table_column_types = ", ".join([f"{col} {dtype}" for col, dtype in source_table_types.items()])
+        logger.info(f"使用源表列类型: {create_table_column_types}")
 
+        # 写入数据库，使用源表类型
         result.write \
             .format("jdbc") \
             .option("url", jdbc_url) \
             .option("dbtable", target_table) \
-            .mode(write_mode) \
+            .option("createTableColumnTypes", create_table_column_types) \
+            .mode("overwrite") \
             .options(**jdbc_properties) \
             .save()
-
-        row_count = result.count()
-        logger.info(f"成功写入 {row_count} 行到表 {target_table}")
+        logger.info(f"成功写入内置数据库: {target_table}")
         return target_table
     except Exception as e:
         logger.error(f"写入内置数据库失败: {e}")
         import traceback
         logger.error(traceback.format_exc())
         return None
-    
+
 def save_dataframe_to_target_table(result, config):
     # 参数校验
     if not config.embedded_dbType:
@@ -1017,11 +1000,51 @@ def save_dataframe_to_target_table(result, config):
         jdbc_properties["password"] = config.embedded_password
 
     try:
-        # 1. 直接写入目标表，但先不设置主键
+        # 从数据库读取表结构信息
+        if config.embedded_dbType == "1":  # MySQL
+            import mysql.connector
+            conn = mysql.connector.connect(
+                host=config.embedded_host,
+                port=config.embedded_port,
+                user=config.embedded_username,
+                password=config.embedded_password,
+                database=config.embedded_dbName
+            )
+            # 获取列类型
+            cursor = conn.cursor()
+            cursor.execute(f"SHOW COLUMNS FROM {config.embedded_table} WHERE Field = %s", (config.orderby_column,))
+            column_info = cursor.fetchone()
+            original_type = column_info[1]  # 获取原始类型
+        else:  # KingBase
+            import psycopg2
+            conn = psycopg2.connect(
+                host=config.embedded_host,
+                port=config.embedded_port,
+                user=config.embedded_username,
+                password=config.embedded_password,
+                database=config.embedded_dbName
+            )
+            # 获取列类型
+            cursor = conn.cursor()
+            cursor.execute(f"""
+                SELECT data_type, character_maximum_length 
+                FROM information_schema.columns 
+                WHERE table_name = %s AND column_name = %s
+            """, (config.embedded_table, config.orderby_column))
+            column_info = cursor.fetchone()
+            if column_info[1]:  # 如果有长度限制
+                original_type = f"{column_info[0]}({column_info[1]})"
+            else:
+                original_type = column_info[0]
+
+        logger.info(f"保持原始列类型: {config.orderby_column} {original_type}")
+
+        # 1. 直接写入目标表，使用原始类型
         result.write \
             .format("jdbc") \
             .option("url", jdbc_url) \
             .option("dbtable", target_table) \
+            .option("createTableColumnTypes", f"{config.orderby_column} {original_type}") \
             .mode("overwrite") \
             .options(**jdbc_properties) \
             .save()
@@ -1100,6 +1123,65 @@ def save_dataframe_to_target_table(result, config):
 
 def read_dataframe_from_minio(arrow_uploader, spark, bucket, object):
     return arrow_uploader.read_from_minio(spark, bucket, object)
+
+def get_source_table_column_types(config):
+    """
+    获取源表的列类型信息
+    
+    Args:
+        config: 配置对象，需包含数据库连接信息
+        
+    Returns:
+        dict: 列类型映射字典，格式为 {column_name: data_type}
+    """
+    try:
+        if config.dbType == "1":  # MySQL
+            import mysql.connector
+            conn = mysql.connector.connect(
+                host=config.host,
+                port=config.port,
+                user=config.username,
+                password=config.password,
+                database=config.dbName
+            )
+            cursor = conn.cursor()
+            cursor.execute(f"SHOW COLUMNS FROM {config.db_table}")
+            columns_info = cursor.fetchall()
+            source_table_types = {col_info[0]: col_info[1] for col_info in columns_info}
+        else:  # KingBase
+            import psycopg2
+            conn = psycopg2.connect(
+                host=config.host,
+                port=config.port,
+                user=config.username,
+                password=config.password,
+                database=config.dbName
+            )
+            cursor = conn.cursor()
+            cursor.execute(f"""
+                SELECT column_name, data_type, character_maximum_length 
+                FROM information_schema.columns 
+                WHERE table_name = %s
+            """, (config.db_table,))
+            columns_info = cursor.fetchall()
+            source_table_types = {}
+            for col_info in columns_info:
+                if col_info[2]:  # 如果有长度限制
+                    source_table_types[col_info[0]] = f"{col_info[1]}({col_info[2]})"
+                else:
+                    source_table_types[col_info[0]] = col_info[1]
+                    
+        logger.info(f"获取源表列类型成功: {source_table_types}")
+        return source_table_types
+        
+    except Exception as e:
+        logger.error(f"获取源表列类型失败: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise
+    finally:
+        if 'conn' in locals():
+            conn.close()
 
 
 def get_data_size_gb(spark, config):
